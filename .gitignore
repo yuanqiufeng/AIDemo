@@ -1,0 +1,9 @@
+.gradle/
+build/
+local.properties
+
+android/.gradle/
+android/build/
+android/local.properties
+
+server/target/

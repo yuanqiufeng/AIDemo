@@ -1,6 +1,10 @@
 server:
   port: 8080
 
+spring:
+  main:
+    web-application-type: reactive
+
 realtime:
   audio:
     sample-rate: 16000

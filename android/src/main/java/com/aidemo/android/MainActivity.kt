@@ -31,6 +31,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.aidemo.android.realtime.RealtimeViewModel
+import com.aidemo.android.realtime.RealtimeViewModel.Companion.DEFAULT_SERVER_URL
 
 class MainActivity : ComponentActivity() {
     private val viewModel: RealtimeViewModel by viewModels()
@@ -58,7 +59,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun RealtimeApp(viewModel: RealtimeViewModel, onStart: () -> Unit) {
     val ui by viewModel.ui.collectAsState()
-    var serverUrl by remember { mutableStateOf("ws://10.0.2.2:8080/ws/realtime") }
+    var serverUrl by remember { mutableStateOf(DEFAULT_SERVER_URL) }
 
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize()) {

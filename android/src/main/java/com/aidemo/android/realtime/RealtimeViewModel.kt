@@ -27,7 +27,7 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
     private val audioEngine = FullDuplexAudioEngine(application.applicationContext)
     private val _ui = MutableStateFlow(RealtimeUiState())
     val ui: StateFlow<RealtimeUiState> = _ui
-    private var serverUrl = "ws://10.0.2.2:8080/ws/realtime"
+    private var serverUrl = DEFAULT_SERVER_URL
     private var webSocket: WebSocket? = null
     private var audioJob: Job? = null
 
@@ -118,4 +118,8 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
 
     private fun RealtimeUiState.log(line: String): RealtimeUiState =
         copy(events = events + line)
+
+    companion object {
+        const val DEFAULT_SERVER_URL = "ws://127.0.0.1:8080/ws/realtime"
+    }
 }
