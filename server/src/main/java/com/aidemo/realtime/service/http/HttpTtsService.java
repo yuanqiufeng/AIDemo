@@ -14,6 +14,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.util.Base64;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -21,7 +22,7 @@ import java.util.concurrent.atomic.AtomicLong;
 @ConditionalOnProperty(prefix = "realtime.tts", name = "mode", havingValue = "http")
 public class HttpTtsService implements TtsService {
     private static final Logger log = LoggerFactory.getLogger(HttpTtsService.class);
-    private static final int MAX_TEXT_CHARS = 60;
+    private static final int MAX_TEXT_CHARS = 45;
 
     private final WebClient webClient;
     private final RealtimeProperties properties;
@@ -43,18 +44,22 @@ public class HttpTtsService implements TtsService {
 
     private Flux<TtsChunk> synthesize(String sessionId, String text, AtomicLong sequence) {
         return webClient.post()
-                .uri("/tts/stream")
-                .accept(MediaType.TEXT_EVENT_STREAM)
+                .uri("/tts")
+                .accept(MediaType.APPLICATION_JSON)
                 .bodyValue(Map.of("sessionId", sessionId, "text", text))
                 .retrieve()
-                .bodyToFlux(String.class)
-                .map(this::readEvent)
+                .bodyToMono(TtsResponse.class)
+                .flatMapMany(response -> Flux.fromIterable(response.chunks() == null ? List.of() : response.chunks()))
                 .map(event -> {
                     byte[] pcm = Base64.getDecoder().decode(event.getOrDefault("audio", ""));
                     int sampleRate = Integer.parseInt(event.getOrDefault("sampleRate", String.valueOf(properties.tts().sampleRate())));
                     return new TtsChunk(sequence.incrementAndGet(), pcm, sampleRate);
                 })
-                .doOnComplete(() -> log.info("TTS synth complete: session={}, textChars={}", sessionId, text.length()));
+                .doOnComplete(() -> log.info("TTS synth complete: session={}, textChars={}", sessionId, text.length()))
+                .onErrorResume(error -> {
+                    log.warn("TTS synth failed: session={}, text={}", sessionId, text, error);
+                    return Flux.empty();
+                });
     }
 
     private Flux<String> sentenceChunks(Flux<String> textDeltas) {
@@ -80,8 +85,18 @@ public class HttpTtsService implements TtsService {
         if (text.isEmpty()) {
             return false;
         }
-        char last = text.charAt(text.length() - 1);
-        return "。！？!?；;\n".indexOf(last) >= 0;
+        return isSentenceEnd(text.charAt(text.length() - 1));
+    }
+
+    private boolean isSentenceEnd(char value) {
+        return value == '\u3002'
+                || value == '\uff01'
+                || value == '\uff1f'
+                || value == '!'
+                || value == '?'
+                || value == '\uff1b'
+                || value == ';'
+                || value == '\n';
     }
 
     private String drain(StringBuilder text) {
@@ -97,5 +112,8 @@ public class HttpTtsService implements TtsService {
         } catch (Exception error) {
             throw new IllegalArgumentException("Bad TTS event", error);
         }
+    }
+
+    private record TtsResponse(List<Map<String, String>> chunks, String sampleRate) {
     }
 }

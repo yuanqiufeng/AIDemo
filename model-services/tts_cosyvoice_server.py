@@ -1,9 +1,11 @@
 import base64
+import asyncio
 import json
 import logging
 import math
 import os
 import sys
+import time
 from typing import AsyncIterator
 
 import numpy as np
@@ -33,9 +35,15 @@ except Exception as error:  # pragma: no cover
 MODEL_DIR = os.getenv("COSYVOICE_MODEL_DIR", "D:/models/iic/CosyVoice2-0___5B")
 SAMPLE_RATE = int(os.getenv("COSYVOICE_SAMPLE_RATE", "24000"))
 SPEAKER_ID = os.getenv("COSYVOICE_SPEAKER_ID", "\u4e2d\u6587\u5973")
+TTS_MODE = os.getenv("COSYVOICE_TTS_MODE", "zero_shot")
+PROMPT_TEXT = os.getenv("COSYVOICE_PROMPT_TEXT", "\u5e0c\u671b\u4f60\u4ee5\u540e\u80fd\u591f\u505a\u7684\u6bd4\u6211\u8fd8\u597d\u5466\u3002")
+PROMPT_WAV = os.getenv("COSYVOICE_PROMPT_WAV", os.path.join(COSYVOICE_REPO, "asset", "zero_shot_prompt.wav"))
+INSTRUCT_TEXT = os.getenv("COSYVOICE_INSTRUCT_TEXT", "\u7528\u666e\u901a\u8bdd\u81ea\u7136\u5730\u8bf4\u8fd9\u53e5\u8bdd<|endofprompt|>")
+SYNTH_TIMEOUT_SECONDS = float(os.getenv("COSYVOICE_SYNTH_TIMEOUT_SECONDS", "45"))
 
 app = FastAPI(title="AIDemo CosyVoice Streaming TTS")
 cosyvoice = None
+tts_lock = asyncio.Lock()
 
 
 class TtsRequest(BaseModel):
@@ -49,9 +57,9 @@ def load_model() -> None:
     if CosyVoice2 is None:
         logger.warning("cosyvoice is not installed; TTS service will return fallback tones")
         return
-    logger.info("Loading CosyVoice model: model_dir=%s, speaker=%s", MODEL_DIR, SPEAKER_ID)
+    logger.info("Loading CosyVoice model: model_dir=%s, mode=%s, prompt_wav=%s", MODEL_DIR, TTS_MODE, PROMPT_WAV)
     cosyvoice = CosyVoice2(MODEL_DIR, load_jit=False, load_trt=False, fp16=False)
-    logger.info("CosyVoice model loaded")
+    logger.info("CosyVoice model loaded: sample_rate=%s", getattr(cosyvoice, "sample_rate", SAMPLE_RATE))
 
 
 @app.post("/tts/stream")
@@ -60,8 +68,25 @@ async def tts_stream(req: TtsRequest):
     return EventSourceResponse(generate_audio(req.text))
 
 
+@app.post("/tts")
+async def tts_once(req: TtsRequest) -> dict:
+    logger.info("TTS JSON request: session=%s, text=%s, model_loaded=%s", req.sessionId, req.text, cosyvoice is not None)
+    chunks = []
+    async for event in generate_audio(req.text):
+        payload = json.loads(event["data"])
+        chunks.append(payload)
+    return {"chunks": chunks, "sampleRate": str(runtime_sample_rate())}
+
+
 async def generate_audio(text: str) -> AsyncIterator[dict]:
+    async with tts_lock:
+        async for event in generate_audio_locked(text):
+            yield event
+
+
+async def generate_audio_locked(text: str) -> AsyncIterator[dict]:
     chunks = 0
+    started = time.perf_counter()
     if cosyvoice is None:
         for chunk in fallback_tone(text):
             chunks += 1
@@ -69,14 +94,42 @@ async def generate_audio(text: str) -> AsyncIterator[dict]:
         logger.warning("TTS returned fallback tone chunks=%s", chunks)
         return
 
-    for result in cosyvoice.inference_sft(text, SPEAKER_ID, stream=True):
-        audio = result.get("tts_speech")
-        if audio is None:
-            continue
-        pcm = tensor_to_pcm(audio)
-        chunks += 1
-        yield {"data": json.dumps({"audio": encode_pcm(pcm), "sampleRate": str(SAMPLE_RATE)})}
-    logger.info("TTS returned audio chunks=%s", chunks)
+    try:
+        results = await asyncio.wait_for(
+            asyncio.to_thread(lambda: list(inference_results(text))),
+            timeout=SYNTH_TIMEOUT_SECONDS,
+        )
+        for result in results:
+            audio = result.get("tts_speech")
+            if audio is None:
+                continue
+            pcm = tensor_to_pcm(audio)
+            chunks += 1
+            yield {"data": json.dumps({"audio": encode_pcm(pcm), "sampleRate": str(runtime_sample_rate())})}
+            logger.info("TTS chunk ready: chunks=%s, elapsed=%.2fs", chunks, time.perf_counter() - started)
+    except TimeoutError:
+        logger.exception("TTS synthesis timed out after %.1fs; returning fallback tone", SYNTH_TIMEOUT_SECONDS)
+        for chunk in fallback_tone(text):
+            chunks += 1
+            yield {"data": json.dumps({"audio": encode_pcm(chunk), "sampleRate": str(SAMPLE_RATE)})}
+    except Exception:
+        logger.exception("TTS synthesis failed; returning fallback tone")
+        for chunk in fallback_tone(text):
+            chunks += 1
+            yield {"data": json.dumps({"audio": encode_pcm(chunk), "sampleRate": str(SAMPLE_RATE)})}
+    logger.info("TTS returned audio chunks=%s, elapsed=%.2fs", chunks, time.perf_counter() - started)
+
+
+def inference_results(text: str):
+    if TTS_MODE == "sft":
+        return cosyvoice.inference_sft(text, SPEAKER_ID, stream=True)
+    if TTS_MODE == "instruct2":
+        return cosyvoice.inference_instruct2(text, INSTRUCT_TEXT, PROMPT_WAV, stream=True)
+    return cosyvoice.inference_zero_shot(text, PROMPT_TEXT, PROMPT_WAV, stream=True)
+
+
+def runtime_sample_rate() -> int:
+    return int(getattr(cosyvoice, "sample_rate", SAMPLE_RATE) or SAMPLE_RATE)
 
 
 def tensor_to_pcm(audio) -> bytes:
