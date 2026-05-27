@@ -15,15 +15,15 @@ realtime:
     silence-endpoint-ms: 520
     interrupt-rms: 0.022
   asr:
-    mode: mock
+    mode: http
     base-url: http://127.0.0.1:10095
     connect-timeout: 1500ms
-    response-timeout: 3000ms
+    response-timeout: 30000ms
   llm:
-    mode: mock
+    mode: http
     base-url: http://127.0.0.1:8001
-    model: qwen-plus
+    model: deepseek-v4-pro
   tts:
-    mode: mock
+    mode: http
     base-url: http://127.0.0.1:8002
     sample-rate: 24000

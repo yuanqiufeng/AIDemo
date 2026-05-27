@@ -1,6 +1,7 @@
 import base64
 import json
 import math
+import os
 from typing import AsyncIterator
 
 import numpy as np
@@ -14,8 +15,10 @@ except Exception:  # pragma: no cover
     CosyVoice2 = None
 
 
-MODEL_DIR = "iic/CosyVoice2-0.5B"
-SAMPLE_RATE = 24000
+MODEL_DIR = os.getenv("COSYVOICE_MODEL_DIR", "D:/models/iic/CosyVoice2-0___5B")
+SAMPLE_RATE = int(os.getenv("COSYVOICE_SAMPLE_RATE", "24000"))
+SPEAKER_ID = os.getenv("COSYVOICE_SPEAKER_ID", "中文女")
+
 app = FastAPI(title="AIDemo CosyVoice Streaming TTS")
 cosyvoice = None
 
@@ -43,7 +46,7 @@ async def generate_audio(text: str) -> AsyncIterator[dict]:
             yield {"data": json.dumps({"audio": encode_pcm(chunk), "sampleRate": str(SAMPLE_RATE)})}
         return
 
-    for result in cosyvoice.inference_sft(text, "中文女", stream=True):
+    for result in cosyvoice.inference_sft(text, SPEAKER_ID, stream=True):
         audio = result.get("tts_speech")
         if audio is None:
             continue

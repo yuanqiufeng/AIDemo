@@ -40,16 +40,15 @@ class FullDuplexAudioEngine(private val context: Context) {
         val minBuffer = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
         val bufferSize = maxOf(minBuffer, frameBytes * 8)
         val record = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            MediaRecorder.AudioSource.MIC,
             sampleRate,
             channelConfig,
             audioFormat,
             bufferSize
         )
         recorder = record
-        enableAudioProcessing(record.audioSessionId)
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        audioManager.mode = AudioManager.MODE_NORMAL
         running.set(true)
         startPlaybackIfNeeded(playbackRate)
         record.startRecording()

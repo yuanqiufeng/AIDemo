@@ -1,4 +1,5 @@
 import base64
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List
 
@@ -12,8 +13,10 @@ except Exception:  # pragma: no cover - keeps the server importable before deps 
     AutoModel = None
 
 
-ONLINE_MODEL = "iic/speech_paraformer_asr_nat-zh-cn-16k-common-vocab8404-online"
-FINAL_MODEL = "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+ONLINE_MODEL = os.getenv("ASR_ONLINE_MODEL", "")
+FINAL_MODEL = os.getenv("ASR_FINAL_MODEL", os.getenv("ASR_MODEL", "D:/models/FunAudioLLM/Fun-ASR-Nano-2512"))
+ASR_DEVICE = os.getenv("ASR_DEVICE", "cuda:0")
+ASR_LANGUAGE = os.getenv("ASR_LANGUAGE", "zh")
 
 
 class PartialRequest(BaseModel):
@@ -47,8 +50,15 @@ def load_models() -> None:
     global online_model, final_model
     if AutoModel is None:
         return
-    online_model = AutoModel(model=ONLINE_MODEL, disable_update=True)
-    final_model = AutoModel(model=FINAL_MODEL, disable_update=True)
+    if ONLINE_MODEL:
+        online_model = AutoModel(model=ONLINE_MODEL, disable_update=True, device=ASR_DEVICE)
+    final_model = AutoModel(
+        model=FINAL_MODEL,
+        disable_update=True,
+        trust_remote_code=True,
+        remote_code="./model.py",
+        device=ASR_DEVICE,
+    )
 
 
 @app.post("/asr/partial")
@@ -90,7 +100,7 @@ def final(req: FinalRequest) -> dict:
         seconds = max(1, int(len(pcm) / 16000))
         return {"text": f"收到一段约 {seconds} 秒的语音"}
 
-    result = final_model.generate(input=pcm)
+    result = final_model.generate(input=pcm, cache={}, batch_size=1, language=ASR_LANGUAGE, itn=True)
     return {"text": extract_text(result)}
 
 
