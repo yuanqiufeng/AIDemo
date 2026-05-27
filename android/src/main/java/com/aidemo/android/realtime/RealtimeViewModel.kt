@@ -32,6 +32,7 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
     private var webSocket: WebSocket? = null
     private var audioJob: Job? = null
     private var sentAudioFrames = 0L
+    private var receivedTtsChunks = 0L
 
     fun updateServerUrl(url: String) {
         serverUrl = url
@@ -49,6 +50,24 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
         audioEngine.stopPlayback()
     }
 
+    fun sendText(text: String) {
+        val trimmed = text.trim()
+        if (trimmed.isBlank()) return
+        val sent = webSocket?.send(
+            JSONObject()
+                .put("type", "audio.end")
+                .put("text", trimmed)
+                .toString()
+        ) ?: false
+        _ui.update {
+            if (sent) {
+                it.copy(state = "thinking").log("you: $trimmed")
+            } else {
+                it.copy(state = "error").log("text send failed: WebSocket is not connected")
+            }
+        }
+    }
+
     fun disconnect() {
         audioJob?.cancel()
         audioJob = null
@@ -60,6 +79,7 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            receivedTtsChunks = 0
             _ui.update { it.copy(connected = true, state = "listening").log("connected") }
             startAudioLoop(webSocket)
         }
@@ -114,7 +134,13 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
             "tts.chunk" -> event.audio?.let { audio ->
                 val bytes = audio.decodeBase64()?.toByteArray()
                 if (bytes != null) {
+                    receivedTtsChunks += 1
+                    if (receivedTtsChunks == 1L || receivedTtsChunks % 10L == 0L) {
+                        _ui.update { it.log("tts.chunk count=$receivedTtsChunks bytes=${bytes.size} sampleRate=${event.sampleRate ?: 24000}") }
+                    }
                     audioEngine.play(bytes, event.sampleRate ?: 24000)
+                } else {
+                    _ui.update { it.log("tts.chunk decode failed") }
                 }
             }
             "tts.done" -> _ui.update { it.copy(state = "listening").log("tts.done") }

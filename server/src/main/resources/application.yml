@@ -9,11 +9,11 @@ realtime:
   audio:
     sample-rate: 16000
     frame-ms: 20
-    speech-start-rms: 0.018
-    speech-end-rms: 0.010
-    min-speech-ms: 120
-    silence-endpoint-ms: 520
-    interrupt-rms: 0.022
+    speech-start-rms: 0.030
+    speech-end-rms: 0.014
+    min-speech-ms: 260
+    silence-endpoint-ms: 700
+    interrupt-rms: 0.040
   asr:
     mode: http
     base-url: http://127.0.0.1:10095

@@ -62,6 +62,7 @@ class FullDuplexAudioEngine(private val context: Context) {
     }
 
     fun play(pcm16le: ByteArray, sampleRate: Int) {
+        if (pcm16le.isEmpty()) return
         if (sampleRate != playbackRate || audioTrack == null) {
             stopPlayback()
             playbackRate = sampleRate
@@ -113,7 +114,7 @@ class FullDuplexAudioEngine(private val context: Context) {
         val track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
@@ -129,7 +130,13 @@ class FullDuplexAudioEngine(private val context: Context) {
             .build()
         audioTrack = track
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        audioManager.mode = AudioManager.MODE_NORMAL
+        audioManager.isSpeakerphoneOn = true
+        audioManager.setStreamVolume(
+            AudioManager.STREAM_MUSIC,
+            maxOf(audioManager.getStreamVolume(AudioManager.STREAM_MUSIC), audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC) / 2),
+            0
+        )
         track.play()
         playbackRunning.set(true)
         playbackThread = thread(name = "realtime-playback", isDaemon = true) {

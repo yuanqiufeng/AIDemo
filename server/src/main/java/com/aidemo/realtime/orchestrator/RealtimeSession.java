@@ -1,6 +1,7 @@
 package com.aidemo.realtime.orchestrator;
 
 import com.aidemo.realtime.audio.AudioFrame;
+import com.aidemo.realtime.audio.PcmAudio;
 import com.aidemo.realtime.audio.StreamingVad;
 import com.aidemo.realtime.config.RealtimeProperties;
 import com.aidemo.realtime.protocol.EventType;
@@ -8,6 +9,8 @@ import com.aidemo.realtime.protocol.ServerEvent;
 import com.aidemo.realtime.service.AsrService;
 import com.aidemo.realtime.service.LlmService;
 import com.aidemo.realtime.service.TtsService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Sinks;
@@ -19,9 +22,12 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class RealtimeSession {
+    private static final Logger log = LoggerFactory.getLogger(RealtimeSession.class);
+
     private final String id = UUID.randomUUID().toString();
     private final RealtimeProperties properties;
     private final AsrService asrService;
@@ -128,9 +134,22 @@ public class RealtimeSession {
     }
 
     private void recognizeAndRespond(List<AudioFrame> finished) {
+        log.info("ASR final start: session={}, frames={}, durationMs={}, rms={}",
+                id,
+                finished.size(),
+                durationMs(finished),
+                String.format("%.4f", rms(finished)));
         asrService.finalText(id, finished)
                 .defaultIfEmpty("")
-                .subscribe(text -> recognizeAndRespond(finished, text), this::emitError);
+                .subscribe(text -> {
+                    if (text == null || text.isBlank()) {
+                        log.info("ASR final empty/ignored: session={}, frames={}, rms={}",
+                                id, finished.size(), String.format("%.4f", rms(finished)));
+                    } else {
+                        log.info("ASR final text: session={}, text={}", id, text);
+                    }
+                    recognizeAndRespond(finished, text);
+                }, this::emitError);
     }
 
     private void recognizeAndRespond(List<AudioFrame> finished, String text) {
@@ -140,14 +159,29 @@ public class RealtimeSession {
         interrupt("new-turn");
         emit(ServerEvent.text(EventType.ASR_FINAL, id, text, true));
 
+        AtomicInteger llmChars = new AtomicInteger();
         Flux<String> llm = llmService.streamReply(id, text)
-                .doOnNext(delta -> emit(ServerEvent.text(EventType.LLM_DELTA, id, delta, false)))
-                .doOnComplete(() -> emit(ServerEvent.of(EventType.LLM_DONE, id)))
+                .doOnNext(delta -> {
+                    llmChars.addAndGet(delta.length());
+                    emit(ServerEvent.text(EventType.LLM_DELTA, id, delta, false));
+                })
+                .doOnComplete(() -> {
+                    log.info("LLM done: session={}, responseChars={}", id, llmChars.get());
+                    emit(ServerEvent.of(EventType.LLM_DONE, id));
+                })
                 .share();
 
         assistantSpeaking.set(true);
         emit(ServerEvent.of(EventType.TTS_START, id));
+        AtomicInteger ttsChunks = new AtomicInteger();
         responsePipeline = ttsService.streamAudio(id, llm)
+                .doOnNext(chunk -> {
+                    int count = ttsChunks.incrementAndGet();
+                    if (count == 1 || count % 10 == 0) {
+                        log.info("TTS chunk: session={}, count={}, bytes={}, sampleRate={}",
+                                id, count, chunk.pcm16le().length, chunk.sampleRate());
+                    }
+                })
                 .map(chunk -> ServerEvent.audio(
                         EventType.TTS_CHUNK,
                         id,
@@ -158,13 +192,34 @@ public class RealtimeSession {
                 .doOnNext(this::emit)
                 .doOnComplete(() -> {
                     assistantSpeaking.set(false);
+                    log.info("TTS done: session={}, chunks={}", id, ttsChunks.get());
                     emit(ServerEvent.of(EventType.TTS_DONE, id));
                 })
                 .subscribe(event -> {
                 }, error -> {
                     assistantSpeaking.set(false);
+                    log.warn("Realtime response pipeline failed: session={}", id, error);
                     emitError(error);
                 });
+    }
+
+    private int durationMs(List<AudioFrame> frames) {
+        int bytes = frames.stream().mapToInt(frame -> frame.pcm16le().length).sum();
+        return bytes / Math.max(1, properties.audio().sampleRate() * 2 / 1000);
+    }
+
+    private double rms(List<AudioFrame> frames) {
+        int totalLength = frames.stream().mapToInt(frame -> frame.pcm16le().length).sum();
+        if (totalLength == 0) {
+            return 0.0;
+        }
+        byte[] pcm = new byte[totalLength];
+        int offset = 0;
+        for (AudioFrame frame : frames) {
+            System.arraycopy(frame.pcm16le(), 0, pcm, offset, frame.pcm16le().length);
+            offset += frame.pcm16le().length;
+        }
+        return PcmAudio.rms16le(pcm);
     }
 
     private void emit(ServerEvent event) {
