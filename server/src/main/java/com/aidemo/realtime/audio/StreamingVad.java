@@ -51,6 +51,10 @@ public class StreamingVad {
         } else {
             speechMs += frameMs;
             silenceMs = 0;
+            if (config.maxUtteranceMs() > 0 && speechMs >= config.maxUtteranceMs()) {
+                reset();
+                return VadEvent.SPEECH_END;
+            }
         }
         return VadEvent.NONE;
     }

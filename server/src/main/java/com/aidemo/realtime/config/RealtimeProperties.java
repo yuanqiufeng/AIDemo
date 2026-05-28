@@ -17,6 +17,9 @@ public record RealtimeProperties(
             double speechEndRms,
             int minSpeechMs,
             int silenceEndpointMs,
+            int maxUtteranceMs,
+            int assistantEchoHoldMs,
+            boolean bargeInEnabled,
             double interruptRms
     ) {
         public int bytesPerFrame() {

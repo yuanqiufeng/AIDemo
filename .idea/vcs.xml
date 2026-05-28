@@ -2,5 +2,6 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/model/CosyVoice-main/third_party/Matcha-TTS" vcs="Git" />
   </component>
 </project>

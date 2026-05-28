@@ -16,6 +16,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Sinks;
 
 import java.time.Instant;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -39,6 +40,7 @@ public class RealtimeSession {
     private final AtomicLong audioSeq = new AtomicLong();
     private final AtomicBoolean assistantSpeaking = new AtomicBoolean(false);
     private volatile Disposable responsePipeline;
+    private volatile Instant ignoreAudioUntil = Instant.EPOCH;
 
     public RealtimeSession(
             RealtimeProperties properties,
@@ -66,6 +68,11 @@ public class RealtimeSession {
     }
 
     public void acceptAudio(byte[] pcm16le) {
+        if (shouldIgnoreForAssistantEcho()) {
+            utteranceFrames.clear();
+            vad.reset();
+            return;
+        }
         AudioFrame frame = new AudioFrame(
                 audioSeq.incrementAndGet(),
                 pcm16le,
@@ -76,7 +83,13 @@ public class RealtimeSession {
         switch (vad.accept(frame, assistantSpeaking.get())) {
             case SPEECH_START -> {
                 if (assistantSpeaking.get()) {
-                    interrupt("speech-start");
+                    if (properties.audio().bargeInEnabled()) {
+                        interrupt("speech-start");
+                    } else {
+                        utteranceFrames.clear();
+                        vad.reset();
+                        return;
+                    }
                 }
                 utteranceFrames.clear();
                 utteranceFrames.add(frame);
@@ -89,6 +102,11 @@ public class RealtimeSession {
                 recognizeAndRespond(finished);
             }
             case BARGE_IN -> {
+                if (!properties.audio().bargeInEnabled()) {
+                    utteranceFrames.clear();
+                    vad.reset();
+                    return;
+                }
                 interrupt("barge-in");
                 utteranceFrames.clear();
                 utteranceFrames.add(frame);
@@ -125,6 +143,7 @@ public class RealtimeSession {
             pipeline.dispose();
         }
         assistantSpeaking.set(false);
+        holdAssistantEcho();
         emit(new ServerEvent(EventType.INTERRUPT, id, null, null, null, null, null, reason, null));
     }
 
@@ -172,10 +191,13 @@ public class RealtimeSession {
                 .share();
 
         assistantSpeaking.set(true);
+        ignoreAudioUntil = Instant.now().plus(Duration.ofHours(1));
         emit(ServerEvent.of(EventType.TTS_START, id));
         AtomicInteger ttsChunks = new AtomicInteger();
+        AtomicLong ttsPlaybackMs = new AtomicLong();
         responsePipeline = ttsService.streamAudio(id, llm)
                 .doOnNext(chunk -> {
+                    ttsPlaybackMs.addAndGet(chunkDurationMs(chunk.pcm16le().length, chunk.sampleRate()));
                     int count = ttsChunks.incrementAndGet();
                     if (count == 1 || count % 10 == 0) {
                         log.info("TTS chunk: session={}, count={}, bytes={}, sampleRate={}",
@@ -192,12 +214,14 @@ public class RealtimeSession {
                 .doOnNext(this::emit)
                 .doOnComplete(() -> {
                     assistantSpeaking.set(false);
-                    log.info("TTS done: session={}, chunks={}", id, ttsChunks.get());
+                    holdAssistantEcho(ttsPlaybackMs.get());
+                    log.info("TTS done: session={}, chunks={}, playbackMs={}", id, ttsChunks.get(), ttsPlaybackMs.get());
                     emit(ServerEvent.of(EventType.TTS_DONE, id));
                 })
                 .subscribe(event -> {
                 }, error -> {
                     assistantSpeaking.set(false);
+                    holdAssistantEcho(ttsPlaybackMs.get());
                     log.warn("Realtime response pipeline failed: session={}", id, error);
                     emitError(error);
                 });
@@ -206,6 +230,31 @@ public class RealtimeSession {
     private int durationMs(List<AudioFrame> frames) {
         int bytes = frames.stream().mapToInt(frame -> frame.pcm16le().length).sum();
         return bytes / Math.max(1, properties.audio().sampleRate() * 2 / 1000);
+    }
+
+    private boolean shouldIgnoreForAssistantEcho() {
+        return assistantSpeaking.get() || Instant.now().isBefore(ignoreAudioUntil);
+    }
+
+    private void holdAssistantEcho() {
+        holdAssistantEcho(0);
+    }
+
+    private void holdAssistantEcho(long playbackMs) {
+        int holdMs = properties.audio().assistantEchoHoldMs();
+        long totalHoldMs = Math.max(0, playbackMs) + Math.max(0, holdMs);
+        if (totalHoldMs > 0) {
+            ignoreAudioUntil = Instant.now().plus(Duration.ofMillis(totalHoldMs));
+        }
+        utteranceFrames.clear();
+        vad.reset();
+    }
+
+    private long chunkDurationMs(int pcmBytes, int sampleRate) {
+        if (sampleRate <= 0 || pcmBytes <= 0) {
+            return 0;
+        }
+        return Math.round((pcmBytes / 2.0) * 1000.0 / sampleRate);
     }
 
     private double rms(List<AudioFrame> frames) {

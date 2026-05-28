@@ -9,16 +9,19 @@ realtime:
   audio:
     sample-rate: 16000
     frame-ms: 20
-    speech-start-rms: 0.030
-    speech-end-rms: 0.014
-    min-speech-ms: 260
-    silence-endpoint-ms: 700
-    interrupt-rms: 0.040
+    speech-start-rms: 0.0198
+    speech-end-rms: 0.0198
+    min-speech-ms: 320
+    silence-endpoint-ms: 900
+    max-utterance-ms: 600000
+    assistant-echo-hold-ms: 1800
+    barge-in-enabled: false
+    interrupt-rms: 0.0198
   asr:
     mode: http
     base-url: http://127.0.0.1:10095
     connect-timeout: 1500ms
-    response-timeout: 30000ms
+    response-timeout: 120000ms
   llm:
     mode: http
     base-url: http://127.0.0.1:8001

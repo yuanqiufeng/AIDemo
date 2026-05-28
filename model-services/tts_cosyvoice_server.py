@@ -10,6 +10,7 @@ from typing import AsyncIterator
 
 import numpy as np
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -78,10 +79,22 @@ async def tts_once(req: TtsRequest) -> dict:
     return {"chunks": chunks, "sampleRate": str(runtime_sample_rate())}
 
 
+@app.post("/tts/ndjson")
+async def tts_ndjson(req: TtsRequest):
+    logger.info("TTS NDJSON request: session=%s, text=%s, model_loaded=%s", req.sessionId, req.text, cosyvoice is not None)
+    return StreamingResponse(generate_audio_ndjson(req.text), media_type="application/x-ndjson")
+
+
 async def generate_audio(text: str) -> AsyncIterator[dict]:
     async with tts_lock:
         async for event in generate_audio_locked(text):
             yield event
+
+
+async def generate_audio_ndjson(text: str) -> AsyncIterator[bytes]:
+    async with tts_lock:
+        async for event in generate_audio_streaming_locked(text):
+            yield (event["data"] + "\n").encode("utf-8")
 
 
 async def generate_audio_locked(text: str) -> AsyncIterator[dict]:
@@ -118,6 +131,55 @@ async def generate_audio_locked(text: str) -> AsyncIterator[dict]:
             chunks += 1
             yield {"data": json.dumps({"audio": encode_pcm(chunk), "sampleRate": str(SAMPLE_RATE)})}
     logger.info("TTS returned audio chunks=%s, elapsed=%.2fs", chunks, time.perf_counter() - started)
+
+
+async def generate_audio_streaming_locked(text: str) -> AsyncIterator[dict]:
+    chunks = 0
+    started = time.perf_counter()
+    if cosyvoice is None:
+        for chunk in fallback_tone(text):
+            chunks += 1
+            yield {"data": json.dumps({"audio": encode_pcm(chunk), "sampleRate": str(SAMPLE_RATE)})}
+        logger.warning("TTS returned fallback tone chunks=%s", chunks)
+        return
+
+    try:
+        queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+        def worker() -> None:
+            try:
+                for result in inference_results(text):
+                    audio = result.get("tts_speech")
+                    if audio is None:
+                        continue
+                    pcm = tensor_to_pcm(audio)
+                    queue.put_nowait({"audio": encode_pcm(pcm), "sampleRate": str(runtime_sample_rate())})
+            except Exception as error:
+                logger.exception("TTS streaming synthesis failed")
+                queue.put_nowait({"error": str(error)})
+            finally:
+                queue.put_nowait(None)
+
+        task = asyncio.create_task(asyncio.to_thread(worker))
+        while True:
+            item = await asyncio.wait_for(queue.get(), timeout=SYNTH_TIMEOUT_SECONDS)
+            if item is None:
+                break
+            if "error" in item:
+                for chunk in fallback_tone(text):
+                    chunks += 1
+                    yield {"data": json.dumps({"audio": encode_pcm(chunk), "sampleRate": str(SAMPLE_RATE)})}
+                break
+            chunks += 1
+            logger.info("TTS stream chunk ready: chunks=%s, elapsed=%.2fs", chunks, time.perf_counter() - started)
+            yield {"data": json.dumps(item)}
+        await task
+    except TimeoutError:
+        logger.exception("TTS streaming timed out after %.1fs; returning fallback tone", SYNTH_TIMEOUT_SECONDS)
+        for chunk in fallback_tone(text):
+            chunks += 1
+            yield {"data": json.dumps({"audio": encode_pcm(chunk), "sampleRate": str(SAMPLE_RATE)})}
+    logger.info("TTS streaming returned audio chunks=%s, elapsed=%.2fs", chunks, time.perf_counter() - started)
 
 
 def inference_results(text: str):

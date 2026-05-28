@@ -9,12 +9,13 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.ExchangeStrategies;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.util.Arrays;
 import java.util.Base64;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -23,6 +24,8 @@ import java.util.concurrent.atomic.AtomicLong;
 public class HttpTtsService implements TtsService {
     private static final Logger log = LoggerFactory.getLogger(HttpTtsService.class);
     private static final int MAX_TEXT_CHARS = 45;
+    private static final int MAX_RESPONSE_BYTES = 12 * 1024 * 1024;
+    private static final int OUTBOUND_PCM_CHUNK_BYTES = 32 * 1024;
 
     private final WebClient webClient;
     private final RealtimeProperties properties;
@@ -31,7 +34,13 @@ public class HttpTtsService implements TtsService {
     public HttpTtsService(WebClient.Builder builder, RealtimeProperties properties, ObjectMapper objectMapper) {
         this.properties = properties;
         this.objectMapper = objectMapper;
-        this.webClient = builder.baseUrl(properties.tts().baseUrl()).build();
+        ExchangeStrategies strategies = ExchangeStrategies.builder()
+                .codecs(configurer -> configurer.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES))
+                .build();
+        this.webClient = builder
+                .baseUrl(properties.tts().baseUrl())
+                .exchangeStrategies(strategies)
+                .build();
     }
 
     @Override
@@ -44,21 +53,33 @@ public class HttpTtsService implements TtsService {
 
     private Flux<TtsChunk> synthesize(String sessionId, String text, AtomicLong sequence) {
         return webClient.post()
-                .uri("/tts")
-                .accept(MediaType.APPLICATION_JSON)
+                .uri("/tts/ndjson")
+                .accept(MediaType.APPLICATION_NDJSON)
                 .bodyValue(Map.of("sessionId", sessionId, "text", text))
                 .retrieve()
-                .bodyToMono(TtsResponse.class)
-                .flatMapMany(response -> Flux.fromIterable(response.chunks() == null ? List.of() : response.chunks()))
-                .map(event -> {
+                .bodyToFlux(String.class)
+                .map(this::readEvent)
+                .flatMap(event -> {
                     byte[] pcm = Base64.getDecoder().decode(event.getOrDefault("audio", ""));
                     int sampleRate = Integer.parseInt(event.getOrDefault("sampleRate", String.valueOf(properties.tts().sampleRate())));
-                    return new TtsChunk(sequence.incrementAndGet(), pcm, sampleRate);
+                    return splitChunk(sequence, pcm, sampleRate);
                 })
                 .doOnComplete(() -> log.info("TTS synth complete: session={}, textChars={}", sessionId, text.length()))
                 .onErrorResume(error -> {
                     log.warn("TTS synth failed: session={}, text={}", sessionId, text, error);
                     return Flux.empty();
+                });
+    }
+
+    private Flux<TtsChunk> splitChunk(AtomicLong sequence, byte[] pcm, int sampleRate) {
+        if (pcm.length <= OUTBOUND_PCM_CHUNK_BYTES) {
+            return Flux.just(new TtsChunk(sequence.incrementAndGet(), pcm, sampleRate));
+        }
+        return Flux.range(0, (pcm.length + OUTBOUND_PCM_CHUNK_BYTES - 1) / OUTBOUND_PCM_CHUNK_BYTES)
+                .map(index -> {
+                    int start = index * OUTBOUND_PCM_CHUNK_BYTES;
+                    int end = Math.min(start + OUTBOUND_PCM_CHUNK_BYTES, pcm.length);
+                    return new TtsChunk(sequence.incrementAndGet(), Arrays.copyOfRange(pcm, start, end), sampleRate);
                 });
     }
 
@@ -114,6 +135,4 @@ public class HttpTtsService implements TtsService {
         }
     }
 
-    private record TtsResponse(List<Map<String, String>> chunks, String sampleRate) {
-    }
 }
