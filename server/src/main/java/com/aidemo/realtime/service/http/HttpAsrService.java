@@ -24,21 +24,7 @@ public class HttpAsrService implements AsrService {
 
     @Override
     public Flux<String> partial(String sessionId, AudioFrame frame) {
-        String audio = Base64.getEncoder().encodeToString(frame.pcm16le());
-        return webClient.post()
-                .uri("/asr/partial")
-                .bodyValue(Map.of(
-                        "seq", frame.sequence(),
-                        "sampleRate", frame.sampleRate(),
-                        "sessionId", sessionId,
-                        "audio", audio
-                ))
-                .retrieve()
-                .bodyToMono(AsrText.class)
-                .filter(result -> result.text() != null && !result.text().isBlank())
-                .map(AsrText::text)
-                .flux()
-                .onErrorResume(error -> Flux.empty());
+        return Flux.empty();
     }
 
     @Override

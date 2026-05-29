@@ -19,6 +19,8 @@ import java.time.Instant;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -37,6 +39,7 @@ public class RealtimeSession {
     private final StreamingVad vad;
     private final Sinks.Many<ServerEvent> outbound = Sinks.many().multicast().onBackpressureBuffer();
     private final List<AudioFrame> utteranceFrames = new CopyOnWriteArrayList<>();
+    private final Deque<AudioFrame> preRollFrames = new ArrayDeque<>();
     private final AtomicLong audioSeq = new AtomicLong();
     private final AtomicBoolean assistantSpeaking = new AtomicBoolean(false);
     private volatile Disposable responsePipeline;
@@ -80,6 +83,7 @@ public class RealtimeSession {
                 1,
                 Instant.now()
         );
+        rememberPreRoll(frame);
         switch (vad.accept(frame, assistantSpeaking.get())) {
             case SPEECH_START -> {
                 if (assistantSpeaking.get()) {
@@ -92,7 +96,7 @@ public class RealtimeSession {
                     }
                 }
                 utteranceFrames.clear();
-                utteranceFrames.add(frame);
+                utteranceFrames.addAll(preRollFrames);
                 emit(ServerEvent.of(EventType.VAD_SPEECH_START, id));
             }
             case SPEECH_END -> {
@@ -109,7 +113,7 @@ public class RealtimeSession {
                 }
                 interrupt("barge-in");
                 utteranceFrames.clear();
-                utteranceFrames.add(frame);
+                utteranceFrames.addAll(preRollFrames);
                 emit(ServerEvent.of(EventType.VAD_SPEECH_START, id));
             }
             case NONE -> {
@@ -230,6 +234,14 @@ public class RealtimeSession {
     private int durationMs(List<AudioFrame> frames) {
         int bytes = frames.stream().mapToInt(frame -> frame.pcm16le().length).sum();
         return bytes / Math.max(1, properties.audio().sampleRate() * 2 / 1000);
+    }
+
+    private void rememberPreRoll(AudioFrame frame) {
+        preRollFrames.addLast(frame);
+        int maxFrames = Math.max(1, 400 / Math.max(1, properties.audio().frameMs()));
+        while (preRollFrames.size() > maxFrames) {
+            preRollFrames.removeFirst();
+        }
     }
 
     private boolean shouldIgnoreForAssistantEcho() {

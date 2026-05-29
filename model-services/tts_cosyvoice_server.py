@@ -27,20 +27,26 @@ for path in (COSYVOICE_REPO, os.path.join(COSYVOICE_REPO, "third_party", "Matcha
 logger = logging.getLogger("aidemo.tts")
 
 try:
-    from cosyvoice.cli.cosyvoice import CosyVoice2
+    from cosyvoice.cli.cosyvoice import CosyVoice2, CosyVoice3
 except Exception as error:  # pragma: no cover
     logger.warning("failed to import CosyVoice2: %s", error)
     CosyVoice2 = None
+    CosyVoice3 = None
 
 
-MODEL_DIR = os.getenv("COSYVOICE_MODEL_DIR", "D:/models/iic/CosyVoice2-0___5B")
+MODEL_DIR = os.getenv("COSYVOICE_MODEL_DIR", "D:/models/models/FunAudioLLM/Fun-CosyVoice3-0___5B-2512")
 SAMPLE_RATE = int(os.getenv("COSYVOICE_SAMPLE_RATE", "24000"))
 SPEAKER_ID = os.getenv("COSYVOICE_SPEAKER_ID", "\u4e2d\u6587\u5973")
 TTS_MODE = os.getenv("COSYVOICE_TTS_MODE", "zero_shot")
-PROMPT_TEXT = os.getenv("COSYVOICE_PROMPT_TEXT", "\u5e0c\u671b\u4f60\u4ee5\u540e\u80fd\u591f\u505a\u7684\u6bd4\u6211\u8fd8\u597d\u5466\u3002")
+PROMPT_TEXT = os.getenv(
+    "COSYVOICE_PROMPT_TEXT",
+    "You are a helpful assistant.<|endofprompt|>\u5e0c\u671b\u4f60\u4ee5\u540e\u80fd\u591f\u505a\u7684\u6bd4\u6211\u8fd8\u597d\u5466\u3002",
+)
 PROMPT_WAV = os.getenv("COSYVOICE_PROMPT_WAV", os.path.join(COSYVOICE_REPO, "asset", "zero_shot_prompt.wav"))
-INSTRUCT_TEXT = os.getenv("COSYVOICE_INSTRUCT_TEXT", "\u7528\u666e\u901a\u8bdd\u81ea\u7136\u5730\u8bf4\u8fd9\u53e5\u8bdd<|endofprompt|>")
+INSTRUCT_TEXT = os.getenv("COSYVOICE_INSTRUCT_TEXT", "You are a helpful assistant. \u8bf7\u7528\u666e\u901a\u8bdd\u81ea\u7136\u5730\u8bf4\u8fd9\u53e5\u8bdd\u3002<|endofprompt|>")
 SYNTH_TIMEOUT_SECONDS = float(os.getenv("COSYVOICE_SYNTH_TIMEOUT_SECONDS", "45"))
+WARMUP_ENABLED = os.getenv("COSYVOICE_WARMUP", "1") != "0"
+WARMUP_TEXT = os.getenv("COSYVOICE_WARMUP_TEXT", "\u4f60\u597d\u3002")
 
 app = FastAPI(title="AIDemo CosyVoice Streaming TTS")
 cosyvoice = None
@@ -59,8 +65,14 @@ def load_model() -> None:
         logger.warning("cosyvoice is not installed; TTS service will return fallback tones")
         return
     logger.info("Loading CosyVoice model: model_dir=%s, mode=%s, prompt_wav=%s", MODEL_DIR, TTS_MODE, PROMPT_WAV)
-    cosyvoice = CosyVoice2(MODEL_DIR, load_jit=False, load_trt=False, fp16=False)
+    if os.path.exists(os.path.join(MODEL_DIR, "cosyvoice3.yaml")):
+        if CosyVoice3 is None:
+            raise RuntimeError("CosyVoice3 runtime is unavailable")
+        cosyvoice = CosyVoice3(MODEL_DIR, load_trt=False, fp16=True)
+    else:
+        cosyvoice = CosyVoice2(MODEL_DIR, load_jit=False, load_trt=False, fp16=True)
     logger.info("CosyVoice model loaded: sample_rate=%s", getattr(cosyvoice, "sample_rate", SAMPLE_RATE))
+    warmup_model()
 
 
 @app.post("/tts/stream")
@@ -145,6 +157,10 @@ async def generate_audio_streaming_locked(text: str) -> AsyncIterator[dict]:
 
     try:
         queue: asyncio.Queue[dict | None] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def put_threadsafe(item: dict | None) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, item)
 
         def worker() -> None:
             try:
@@ -153,12 +169,12 @@ async def generate_audio_streaming_locked(text: str) -> AsyncIterator[dict]:
                     if audio is None:
                         continue
                     pcm = tensor_to_pcm(audio)
-                    queue.put_nowait({"audio": encode_pcm(pcm), "sampleRate": str(runtime_sample_rate())})
+                    put_threadsafe({"audio": encode_pcm(pcm), "sampleRate": str(runtime_sample_rate())})
             except Exception as error:
                 logger.exception("TTS streaming synthesis failed")
-                queue.put_nowait({"error": str(error)})
+                put_threadsafe({"error": str(error)})
             finally:
-                queue.put_nowait(None)
+                put_threadsafe(None)
 
         task = asyncio.create_task(asyncio.to_thread(worker))
         while True:
@@ -188,6 +204,20 @@ def inference_results(text: str):
     if TTS_MODE == "instruct2":
         return cosyvoice.inference_instruct2(text, INSTRUCT_TEXT, PROMPT_WAV, stream=True)
     return cosyvoice.inference_zero_shot(text, PROMPT_TEXT, PROMPT_WAV, stream=True)
+
+
+def warmup_model() -> None:
+    if not WARMUP_ENABLED or cosyvoice is None:
+        return
+    started = time.perf_counter()
+    try:
+        chunks = 0
+        for result in inference_results(WARMUP_TEXT):
+            if result.get("tts_speech") is not None:
+                chunks += 1
+        logger.info("TTS warmup complete: chunks=%s, elapsed=%.2fs", chunks, time.perf_counter() - started)
+    except Exception:
+        logger.exception("TTS warmup failed; continuing anyway")
 
 
 def runtime_sample_rate() -> int:

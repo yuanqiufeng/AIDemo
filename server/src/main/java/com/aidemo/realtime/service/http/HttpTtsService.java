@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.AtomicLong;
 @ConditionalOnProperty(prefix = "realtime.tts", name = "mode", havingValue = "http")
 public class HttpTtsService implements TtsService {
     private static final Logger log = LoggerFactory.getLogger(HttpTtsService.class);
-    private static final int MAX_TEXT_CHARS = 45;
+    private static final int MAX_TEXT_CHARS = 8;
     private static final int MAX_RESPONSE_BYTES = 12 * 1024 * 1024;
     private static final int OUTBOUND_PCM_CHUNK_BYTES = 32 * 1024;
 
@@ -117,6 +117,8 @@ public class HttpTtsService implements TtsService {
                 || value == '?'
                 || value == '\uff1b'
                 || value == ';'
+                || value == '\uff0c'
+                || value == ','
                 || value == '\n';
     }
 

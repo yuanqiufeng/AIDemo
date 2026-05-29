@@ -1,9 +1,12 @@
 package com.aidemo.android.realtime
 
 import android.app.Application
+import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aidemo.android.realtime.audio.FullDuplexAudioEngine
+import java.util.concurrent.TimeUnit
+import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -17,9 +20,6 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString.Companion.decodeBase64
 import org.json.JSONObject
-import java.util.concurrent.TimeUnit
-import android.util.Base64
-import kotlin.math.sqrt
 
 class RealtimeViewModel(application: Application) : AndroidViewModel(application) {
     private val client = OkHttpClient.Builder()
@@ -128,8 +128,14 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
             "vad.speech_start" -> _ui.update { it.copy(state = "user speaking").log("vad speech_start") }
             "vad.speech_end" -> _ui.update { it.copy(state = "thinking").log("vad speech_end") }
             "asr.partial" -> _ui.update { it.copy(asrText = event.text.orEmpty()).log("asr.partial ${event.text.orEmpty()}") }
-            "asr.final" -> _ui.update { it.copy(asrText = event.text.orEmpty(), aiText = "").log("asr.final ${event.text.orEmpty()}") }
-            "llm.delta" -> _ui.update { it.copy(aiText = it.aiText + event.text.orEmpty()).log("llm.delta ${event.text.orEmpty()}") }
+            "asr.final" -> {
+                _ui.update { it.copy(asrText = event.text.orEmpty(), aiText = "").log("asr.final ${event.text.orEmpty()}") }
+            }
+            "llm.delta" -> {
+                val delta = event.text.orEmpty()
+                _ui.update { it.copy(aiText = it.aiText + delta).log("llm.delta $delta") }
+            }
+            "llm.done" -> _ui.update { it.log("llm.done") }
             "tts.start" -> _ui.update { it.copy(state = "assistant speaking").log("tts.start") }
             "tts.chunk" -> event.audio?.let { audio ->
                 val bytes = audio.decodeBase64()?.toByteArray()
