@@ -24,7 +24,8 @@ import java.util.concurrent.atomic.AtomicLong;
 @ConditionalOnProperty(prefix = "realtime.tts", name = "mode", havingValue = "http")
 public class HttpTtsService implements TtsService {
     private static final Logger log = LoggerFactory.getLogger(HttpTtsService.class);
-    private static final int MAX_TEXT_CHARS = 8;
+    private static final int MIN_FLUSH_TEXT_CHARS = 12;
+    private static final int MAX_TEXT_CHARS = 24;
     private static final int MAX_RESPONSE_BYTES = 12 * 1024 * 1024;
     private static final int OUTBOUND_PCM_CHUNK_BYTES = 32 * 1024;
 
@@ -125,10 +126,14 @@ public class HttpTtsService implements TtsService {
         if (text.isEmpty()) {
             return false;
         }
-        return isSentenceEnd(text.charAt(text.length() - 1));
+        char last = text.charAt(text.length() - 1);
+        if (isHardSentenceEnd(last)) {
+            return true;
+        }
+        return text.length() >= MIN_FLUSH_TEXT_CHARS && isSoftBreak(last);
     }
 
-    private boolean isSentenceEnd(char value) {
+    private boolean isHardSentenceEnd(char value) {
         return value == '\u3002'
                 || value == '\uff01'
                 || value == '\uff1f'
@@ -136,9 +141,11 @@ public class HttpTtsService implements TtsService {
                 || value == '?'
                 || value == '\uff1b'
                 || value == ';'
-                || value == '\uff0c'
-                || value == ','
                 || value == '\n';
+    }
+
+    private boolean isSoftBreak(char value) {
+        return value == '\uff0c' || value == ',';
     }
 
     private String drain(StringBuilder text) {

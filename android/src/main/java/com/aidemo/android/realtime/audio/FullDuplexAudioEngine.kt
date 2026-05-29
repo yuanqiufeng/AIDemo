@@ -126,7 +126,7 @@ class FullDuplexAudioEngine(private val context: Context) {
                     .build()
             )
             .setTransferMode(AudioTrack.MODE_STREAM)
-            .setBufferSizeInBytes(maxOf(minBuffer, sampleRate / 5 * 2))
+            .setBufferSizeInBytes(maxOf(minBuffer, sampleRate * 2 / 3))
             .build()
         audioTrack = track
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager

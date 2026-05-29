@@ -21,7 +21,7 @@ CONFIG_PATH = os.getenv("PIPER_CONFIG_PATH", os.path.join(MODEL_DIR, "model.onnx
 SAMPLE_RATE = int(os.getenv("PIPER_SAMPLE_RATE", "22050"))
 SYNTH_TIMEOUT_SECONDS = float(os.getenv("PIPER_SYNTH_TIMEOUT_SECONDS", "20"))
 MAX_CHARS_PER_REQUEST = int(os.getenv("PIPER_MAX_CHARS", "80"))
-OUTBOUND_CHUNK_MS = int(os.getenv("PIPER_OUTBOUND_CHUNK_MS", "240"))
+OUTBOUND_CHUNK_MS = int(os.getenv("PIPER_OUTBOUND_CHUNK_MS", "360"))
 WARMUP_ENABLED = os.getenv("PIPER_WARMUP", "1") != "0"
 WARMUP_TEXT = os.getenv("PIPER_WARMUP_TEXT", "\u4f60\u597d\u3002")
 
