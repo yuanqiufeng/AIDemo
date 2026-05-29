@@ -14,6 +14,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.time.OffsetDateTime;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Map;
@@ -47,11 +48,14 @@ public class HttpTtsService implements TtsService {
     public Flux<TtsChunk> streamAudio(String sessionId, Flux<String> textDeltas) {
         AtomicLong sequence = new AtomicLong();
         return sentenceChunks(textDeltas)
-                .doOnNext(text -> log.info("TTS synth start: session={}, text={}", sessionId, text))
                 .concatMap(text -> synthesize(sessionId, text, sequence));
     }
 
     private Flux<TtsChunk> synthesize(String sessionId, String text, AtomicLong sequence) {
+        long startedAt = System.nanoTime();
+        OffsetDateTime startedTime = OffsetDateTime.now();
+        AtomicLong chunks = new AtomicLong();
+        log.info("TTS synth start: session={}, startTime={}, text={}", sessionId, startedTime, text);
         return webClient.post()
                 .uri("/tts/ndjson")
                 .accept(MediaType.APPLICATION_NDJSON)
@@ -64,9 +68,24 @@ public class HttpTtsService implements TtsService {
                     int sampleRate = Integer.parseInt(event.getOrDefault("sampleRate", String.valueOf(properties.tts().sampleRate())));
                     return splitChunk(sequence, pcm, sampleRate);
                 })
-                .doOnComplete(() -> log.info("TTS synth complete: session={}, textChars={}", sessionId, text.length()))
+                .doOnNext(chunk -> chunks.incrementAndGet())
+                .doOnComplete(() -> log.info(
+                        "TTS synth complete: session={}, startTime={}, endTime={}, elapsedMs={}, chunks={}, textChars={}",
+                        sessionId,
+                        startedTime,
+                        OffsetDateTime.now(),
+                        (System.nanoTime() - startedAt) / 1_000_000,
+                        chunks.get(),
+                        text.length()))
                 .onErrorResume(error -> {
-                    log.warn("TTS synth failed: session={}, text={}", sessionId, text, error);
+                    log.warn(
+                            "TTS synth failed: session={}, startTime={}, endTime={}, elapsedMs={}, text={}",
+                            sessionId,
+                            startedTime,
+                            OffsetDateTime.now(),
+                            (System.nanoTime() - startedAt) / 1_000_000,
+                            text,
+                            error);
                     return Flux.empty();
                 });
     }

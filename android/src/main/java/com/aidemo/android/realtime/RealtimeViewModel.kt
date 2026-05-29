@@ -1,14 +1,17 @@
 package com.aidemo.android.realtime
 
 import android.app.Application
+import android.speech.tts.TextToSpeech
 import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aidemo.android.realtime.audio.FullDuplexAudioEngine
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
@@ -31,8 +34,24 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
     private var serverUrl = DEFAULT_SERVER_URL
     private var webSocket: WebSocket? = null
     private var audioJob: Job? = null
+    private var localTts: TextToSpeech? = null
+    private var localTtsReady = false
+    private var localTtsFallbackJob: Job? = null
+    private var receivedServerTtsThisTurn = false
     private var sentAudioFrames = 0L
     private var receivedTtsChunks = 0L
+
+    init {
+        var tts: TextToSpeech? = null
+        tts = TextToSpeech(application.applicationContext) { status ->
+            localTtsReady = status == TextToSpeech.SUCCESS
+            if (localTtsReady) {
+                tts?.language = Locale.CHINA
+                tts?.setSpeechRate(1.08f)
+            }
+        }
+        localTts = tts
+    }
 
     fun updateServerUrl(url: String) {
         serverUrl = url
@@ -47,6 +66,7 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
 
     fun interrupt() {
         webSocket?.send(JSONObject().put("type", "interrupt").toString())
+        stopLocalTtsFallback()
         audioEngine.stopPlayback()
     }
 
@@ -71,10 +91,18 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
     fun disconnect() {
         audioJob?.cancel()
         audioJob = null
+        stopLocalTtsFallback()
         audioEngine.stop()
         webSocket?.close(1000, "client stop")
         webSocket = null
         _ui.update { it.copy(connected = false, state = "idle") }
+    }
+
+    override fun onCleared() {
+        stopLocalTtsFallback()
+        localTts?.shutdown()
+        localTts = null
+        super.onCleared()
     }
 
     private val listener = object : WebSocketListener() {
@@ -129,17 +157,24 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
             "vad.speech_end" -> _ui.update { it.copy(state = "thinking").log("vad speech_end") }
             "asr.partial" -> _ui.update { it.copy(asrText = event.text.orEmpty()).log("asr.partial ${event.text.orEmpty()}") }
             "asr.final" -> {
+                receivedServerTtsThisTurn = false
+                localTtsFallbackJob?.cancel()
                 _ui.update { it.copy(asrText = event.text.orEmpty(), aiText = "").log("asr.final ${event.text.orEmpty()}") }
             }
             "llm.delta" -> {
                 val delta = event.text.orEmpty()
                 _ui.update { it.copy(aiText = it.aiText + delta).log("llm.delta $delta") }
             }
-            "llm.done" -> _ui.update { it.log("llm.done") }
+            "llm.done" -> {
+                _ui.update { it.log("llm.done") }
+                scheduleLocalTtsFallback()
+            }
             "tts.start" -> _ui.update { it.copy(state = "assistant speaking").log("tts.start") }
             "tts.chunk" -> event.audio?.let { audio ->
                 val bytes = audio.decodeBase64()?.toByteArray()
                 if (bytes != null) {
+                    receivedServerTtsThisTurn = true
+                    stopLocalTtsFallback()
                     receivedTtsChunks += 1
                     if (receivedTtsChunks == 1L || receivedTtsChunks % 10L == 0L) {
                         _ui.update { it.log("tts.chunk count=$receivedTtsChunks bytes=${bytes.size} sampleRate=${event.sampleRate ?: 24000}") }
@@ -151,6 +186,7 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
             }
             "tts.done" -> _ui.update { it.copy(state = "listening").log("tts.done") }
             "interrupt" -> {
+                stopLocalTtsFallback()
                 audioEngine.stopPlayback()
                 _ui.update { it.copy(state = "interrupted").log("interrupt ${event.reason.orEmpty()}") }
             }
@@ -161,6 +197,25 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
 
     private fun RealtimeUiState.log(line: String): RealtimeUiState =
         copy(events = events + line)
+
+    private fun scheduleLocalTtsFallback() {
+        localTtsFallbackJob?.cancel()
+        val reply = _ui.value.aiText.trim()
+        if (reply.isBlank()) return
+        localTtsFallbackJob = viewModelScope.launch {
+            delay(1500)
+            if (!receivedServerTtsThisTurn && localTtsReady) {
+                _ui.update { it.log("local tts fallback: no server audio after llm.done") }
+                localTts?.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "fallback-${System.nanoTime()}")
+            }
+        }
+    }
+
+    private fun stopLocalTtsFallback() {
+        localTtsFallbackJob?.cancel()
+        localTtsFallbackJob = null
+        localTts?.stop()
+    }
 
     companion object {
         const val DEFAULT_SERVER_URL = "ws://127.0.0.1:8080/ws/realtime"

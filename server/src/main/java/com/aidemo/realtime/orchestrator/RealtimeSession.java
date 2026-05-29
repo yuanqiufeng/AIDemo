@@ -30,6 +30,8 @@ import java.util.concurrent.atomic.AtomicLong;
 
 public class RealtimeSession {
     private static final Logger log = LoggerFactory.getLogger(RealtimeSession.class);
+    private static final Duration LLM_DELTA_TIMEOUT = Duration.ofSeconds(12);
+    private static final Duration RESPONSE_PIPELINE_TIMEOUT = Duration.ofSeconds(45);
 
     private final String id = UUID.randomUUID().toString();
     private final RealtimeProperties properties;
@@ -181,15 +183,28 @@ public class RealtimeSession {
         }
         interrupt("new-turn");
         emit(ServerEvent.text(EventType.ASR_FINAL, id, text, true));
+        Instant turnStartedAt = Instant.now();
+        log.info("Turn response start: session={}, userText={}", id, text);
 
         AtomicInteger llmChars = new AtomicInteger();
+        AtomicBoolean firstLlmDeltaSeen = new AtomicBoolean(false);
         Flux<String> llm = llmService.streamReply(id, text)
+                .timeout(LLM_DELTA_TIMEOUT, Flux.just("我这边响应有点慢，请再说一遍。"))
+                .onErrorResume(error -> {
+                    log.warn("LLM stream failed before TTS: session={}, elapsedMs={}, error={}",
+                            id, Duration.between(turnStartedAt, Instant.now()).toMillis(), error.toString());
+                    return Flux.just("我这边处理失败了，请再试一次。");
+                })
                 .doOnNext(delta -> {
+                    if (firstLlmDeltaSeen.compareAndSet(false, true)) {
+                        log.info("LLM first delta: session={}, elapsedMs={}", id, Duration.between(turnStartedAt, Instant.now()).toMillis());
+                    }
                     llmChars.addAndGet(delta.length());
                     emit(ServerEvent.text(EventType.LLM_DELTA, id, delta, false));
                 })
                 .doOnComplete(() -> {
-                    log.info("LLM done: session={}, responseChars={}", id, llmChars.get());
+                    log.info("LLM done: session={}, elapsedMs={}, responseChars={}",
+                            id, Duration.between(turnStartedAt, Instant.now()).toMillis(), llmChars.get());
                     emit(ServerEvent.of(EventType.LLM_DONE, id));
                 })
                 .share();
@@ -199,8 +214,14 @@ public class RealtimeSession {
         emit(ServerEvent.of(EventType.TTS_START, id));
         AtomicInteger ttsChunks = new AtomicInteger();
         AtomicLong ttsPlaybackMs = new AtomicLong();
+        AtomicBoolean firstTtsChunkSeen = new AtomicBoolean(false);
         responsePipeline = ttsService.streamAudio(id, llm)
+                .timeout(RESPONSE_PIPELINE_TIMEOUT)
                 .doOnNext(chunk -> {
+                    if (firstTtsChunkSeen.compareAndSet(false, true)) {
+                        log.info("TTS first chunk: session={}, elapsedMs={}, bytes={}, sampleRate={}",
+                                id, Duration.between(turnStartedAt, Instant.now()).toMillis(), chunk.pcm16le().length, chunk.sampleRate());
+                    }
                     ttsPlaybackMs.addAndGet(chunkDurationMs(chunk.pcm16le().length, chunk.sampleRate()));
                     int count = ttsChunks.incrementAndGet();
                     if (count == 1 || count % 10 == 0) {
@@ -219,14 +240,16 @@ public class RealtimeSession {
                 .doOnComplete(() -> {
                     assistantSpeaking.set(false);
                     holdAssistantEcho(ttsPlaybackMs.get());
-                    log.info("TTS done: session={}, chunks={}, playbackMs={}", id, ttsChunks.get(), ttsPlaybackMs.get());
+                    log.info("TTS done: session={}, elapsedMs={}, chunks={}, playbackMs={}",
+                            id, Duration.between(turnStartedAt, Instant.now()).toMillis(), ttsChunks.get(), ttsPlaybackMs.get());
                     emit(ServerEvent.of(EventType.TTS_DONE, id));
                 })
                 .subscribe(event -> {
                 }, error -> {
                     assistantSpeaking.set(false);
                     holdAssistantEcho(ttsPlaybackMs.get());
-                    log.warn("Realtime response pipeline failed: session={}", id, error);
+                    log.warn("Realtime response pipeline failed: session={}, elapsedMs={}",
+                            id, Duration.between(turnStartedAt, Instant.now()).toMillis(), error);
                     emitError(error);
                 });
     }
