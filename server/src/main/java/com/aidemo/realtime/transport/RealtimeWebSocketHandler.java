@@ -78,7 +78,7 @@ public class RealtimeWebSocketHandler implements WebSocketHandler {
                         log.info("Audio stream: realtimeSessionId={}, frames={}, bytes={}, rms={}",
                                 realtime.id(), count, audio.length, String.format("%.4f", com.aidemo.realtime.audio.PcmAudio.rms16le(audio)));
                     }
-                    realtime.acceptAudio(audio);
+                    realtime.acceptAudio(audio, Boolean.TRUE.equals(event.bargeIn()));
                 }
                 case "audio.end" -> {
                     log.info("WebSocket receive audio.end: realtimeSessionId={}, hasText={}",

@@ -20,7 +20,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 @ConditionalOnProperty(prefix = "realtime.llm", name = "mode", havingValue = "http")
 public class HttpLlmService implements LlmService {
     private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(HttpLlmService.class);
-    private static final Duration FIRST_DELTA_TIMEOUT = Duration.ofSeconds(12);
+    private static final String LLM_SLOW_FALLBACK = "\u6211\u8fd9\u8fb9\u54cd\u5e94\u6709\u70b9\u6162\uff0c\u8bf7\u518d\u8bf4\u4e00\u904d\u3002";
+    private static final String LLM_ERROR_FALLBACK = "\u6211\u8fd9\u8fb9\u5904\u7406\u5931\u8d25\u4e86\uff0c\u8bf7\u518d\u8bd5\u4e00\u6b21\u3002";
 
     private final WebClient webClient;
     private final RealtimeProperties properties;
@@ -49,7 +50,7 @@ public class HttpLlmService implements LlmService {
                 ))
                 .retrieve()
                 .bodyToFlux(String.class)
-                .timeout(FIRST_DELTA_TIMEOUT)
+                .timeout(properties.llm().firstDeltaTimeout())
                 .map(this::readEvent)
                 .map(event -> event.getOrDefault("delta", ""))
                 .filter(delta -> !delta.isBlank())
@@ -66,8 +67,8 @@ public class HttpLlmService implements LlmService {
                     log.warn("LLM stream failed: session={}, elapsedMs={}, error={}",
                             sessionId, Duration.between(startedAt, Instant.now()).toMillis(), error.toString());
                     String fallback = error instanceof TimeoutException
-                            ? "我这边响应有点慢，请再说一遍。"
-                            : "我这边处理失败了，请再试一次。";
+                            ? LLM_SLOW_FALLBACK
+                            : LLM_ERROR_FALLBACK;
                     return Flux.just(fallback);
                 });
     }

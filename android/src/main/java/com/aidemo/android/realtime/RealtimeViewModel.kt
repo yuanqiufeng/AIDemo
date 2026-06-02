@@ -7,6 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aidemo.android.realtime.audio.FullDuplexAudioEngine
 import java.util.Locale
+import java.util.ArrayDeque
 import java.util.concurrent.TimeUnit
 import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
@@ -39,7 +40,11 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
     private var localTtsFallbackJob: Job? = null
     private var receivedServerTtsThisTurn = false
     private var sentAudioFrames = 0L
+    private var suppressedPlaybackFrames = 0L
     private var receivedTtsChunks = 0L
+    private val playbackPreRollFrames = ArrayDeque<ByteArray>()
+    @Volatile
+    private var suppressMicUntilMs = 0L
 
     init {
         var tts: TextToSpeech? = null
@@ -131,23 +136,81 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
     private fun startAudioLoop(socket: WebSocket) {
         audioJob?.cancel()
         sentAudioFrames = 0
+        suppressedPlaybackFrames = 0
+        suppressMicUntilMs = 0
+        playbackPreRollFrames.clear()
         _ui.update { it.log("audio capture starting") }
         audioJob = viewModelScope.launch(Dispatchers.IO) {
-            audioEngine.startCapture { pcm ->
-                val audio = Base64.encodeToString(pcm, Base64.NO_WRAP)
-                val payload = JSONObject()
-                    .put("type", "audio.chunk")
-                    .put("audio", audio)
-                    .toString()
-                if (socket.send(payload)) {
-                    sentAudioFrames += 1
-                    if (sentAudioFrames == 1L || sentAudioFrames % 50L == 0L) {
-                        _ui.update { it.log("audio sent frames=$sentAudioFrames rms=${"%.4f".format(pcm.rms16le())}") }
+            audioEngine.startCapture { frame ->
+                if (frame.bargeIn) {
+                    val preRoll = synchronized(playbackPreRollFrames) {
+                        val frames = playbackPreRollFrames.toList()
+                        playbackPreRollFrames.clear()
+                        frames
                     }
-                } else {
-                    _ui.update { it.copy(state = "error").log("audio send failed") }
+                    socket.send(JSONObject().put("type", "interrupt").toString())
+                    stopLocalTtsFallback()
+                    audioEngine.stopPlayback()
+                    suppressMicUntilMs = 0
+                    _ui.update {
+                        it.log(
+                            "audio local bargeIn interrupt rms=${"%.4f".format(frame.rms)} " +
+                                "echo=${"%.4f".format(frame.playbackEchoRms)} " +
+                                "speechMs=${frame.bargeInSpeechMs} preRoll=${preRoll.size}"
+                        )
+                    }
+                    preRoll.forEach { pcm -> sendAudioFrame(socket, pcm, true, frame.rms, true) }
+                } else if (System.currentTimeMillis() < suppressMicUntilMs) {
+                    return@startCapture
+                } else if (frame.playbackActive) {
+                    rememberPlaybackPreRoll(frame.pcm16le)
+                    suppressedPlaybackFrames += 1
+                    if (suppressedPlaybackFrames == 1L || suppressedPlaybackFrames % 25L == 0L) {
+                        _ui.update {
+                            it.log(
+                                "audio suppressed playback rms=${"%.4f".format(frame.rms)} " +
+                                    "echo=${"%.4f".format(frame.playbackEchoRms)} speechMs=${frame.bargeInSpeechMs}"
+                            )
+                        }
+                    }
+                    return@startCapture
                 }
+                sendAudioFrame(socket, frame.pcm16le, frame.bargeIn, frame.rms, frame.playbackActive)
             }
+        }
+    }
+
+    private fun rememberPlaybackPreRoll(pcm16le: ByteArray) {
+        synchronized(playbackPreRollFrames) {
+            playbackPreRollFrames.addLast(pcm16le)
+            while (playbackPreRollFrames.size > BARGE_IN_PREROLL_FRAMES) {
+                playbackPreRollFrames.removeFirst()
+            }
+        }
+    }
+
+    private fun sendAudioFrame(
+        socket: WebSocket,
+        pcm16le: ByteArray,
+        bargeIn: Boolean,
+        rms: Double,
+        playbackActive: Boolean
+    ) {
+        val audio = Base64.encodeToString(pcm16le, Base64.NO_WRAP)
+        val payload = JSONObject()
+            .put("type", "audio.chunk")
+            .put("audio", audio)
+            .put("bargeIn", bargeIn)
+            .toString()
+        if (socket.send(payload)) {
+            sentAudioFrames += 1
+            if (playbackActive && sentAudioFrames % 25L == 0L) {
+                _ui.update { it.log("audio playbackActive rms=${"%.4f".format(rms)}") }
+            } else if (sentAudioFrames == 1L || sentAudioFrames % 50L == 0L) {
+                _ui.update { it.log("audio sent frames=$sentAudioFrames rms=${"%.4f".format(rms)}") }
+            }
+        } else {
+            _ui.update { it.copy(state = "error").log("audio send failed") }
         }
     }
 
@@ -159,7 +222,7 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
             "asr.final" -> {
                 receivedServerTtsThisTurn = false
                 localTtsFallbackJob?.cancel()
-                _ui.update { it.copy(asrText = event.text.orEmpty(), aiText = "").log("asr.final ${event.text.orEmpty()}") }
+                _ui.update { it.copy(state = "thinking", asrText = event.text.orEmpty(), aiText = "").log("asr.final ${event.text.orEmpty()}") }
             }
             "llm.delta" -> {
                 val delta = event.text.orEmpty()
@@ -167,7 +230,6 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
             }
             "llm.done" -> {
                 _ui.update { it.log("llm.done") }
-                scheduleLocalTtsFallback()
             }
             "tts.start" -> _ui.update { it.copy(state = "assistant speaking").log("tts.start") }
             "tts.chunk" -> event.audio?.let { audio ->
@@ -184,7 +246,11 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
                     _ui.update { it.log("tts.chunk decode failed") }
                 }
             }
-            "tts.done" -> _ui.update { it.copy(state = "listening").log("tts.done") }
+            "tts.done" -> {
+                suppressMicUntilMs = audioEngine.playbackSuppressUntil(TTS_TAIL_SUPPRESS_MS)
+                val suppressForMs = (suppressMicUntilMs - System.currentTimeMillis()).coerceAtLeast(0L)
+                _ui.update { it.copy(state = "listening").log("tts.done suppressMic=${suppressForMs}ms") }
+            }
             "interrupt" -> {
                 stopLocalTtsFallback()
                 audioEngine.stopPlayback()
@@ -200,6 +266,7 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
 
     private fun scheduleLocalTtsFallback() {
         localTtsFallbackJob?.cancel()
+        if (!ENABLE_LOCAL_TTS_FALLBACK) return
         val reply = _ui.value.aiText.trim()
         if (reply.isBlank()) return
         localTtsFallbackJob = viewModelScope.launch {
@@ -218,7 +285,10 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
     }
 
     companion object {
-        const val DEFAULT_SERVER_URL = "ws://127.0.0.1:8080/ws/realtime"
+        const val DEFAULT_SERVER_URL = "ws://192.168.31.211:8080/ws/realtime"
+        private const val ENABLE_LOCAL_TTS_FALLBACK = false
+        private const val TTS_TAIL_SUPPRESS_MS = 500L
+        private const val BARGE_IN_PREROLL_FRAMES = 16
     }
 }
 

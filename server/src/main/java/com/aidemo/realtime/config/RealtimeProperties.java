@@ -20,7 +20,11 @@ public record RealtimeProperties(
             int maxUtteranceMs,
             int assistantEchoHoldMs,
             boolean bargeInEnabled,
-            double interruptRms
+            double interruptRms,
+            int interruptMinSpeechMs,
+            int assistantBargeInDelayMs,
+            int bargeInRestartDelayMs,
+            int ttsTailIgnoreMs
     ) {
         public int bytesPerFrame() {
             return sampleRate * frameMs / 1000 * 2;
@@ -38,7 +42,9 @@ public record RealtimeProperties(
     public record Llm(
             String mode,
             String baseUrl,
-            String model
+            String model,
+            Duration firstDeltaTimeout,
+            Duration responseTimeout
     ) {
     }
 

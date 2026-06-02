@@ -25,9 +25,10 @@ import java.util.concurrent.atomic.AtomicLong;
 public class HttpTtsService implements TtsService {
     private static final Logger log = LoggerFactory.getLogger(HttpTtsService.class);
     private static final int MIN_FLUSH_TEXT_CHARS = 12;
-    private static final int MAX_TEXT_CHARS = 24;
+    private static final int MAX_TEXT_CHARS = 28;
     private static final int MAX_RESPONSE_BYTES = 12 * 1024 * 1024;
-    private static final int OUTBOUND_PCM_CHUNK_BYTES = 32 * 1024;
+    private static final int OUTBOUND_PCM_CHUNK_BYTES = 12 * 1024;
+    private static final int TTS_PREFETCH = 2;
 
     private final WebClient webClient;
     private final RealtimeProperties properties;
@@ -49,7 +50,7 @@ public class HttpTtsService implements TtsService {
     public Flux<TtsChunk> streamAudio(String sessionId, Flux<String> textDeltas) {
         AtomicLong sequence = new AtomicLong();
         return sentenceChunks(textDeltas)
-                .concatMap(text -> synthesize(sessionId, text, sequence));
+                .flatMapSequential(text -> synthesize(sessionId, text, sequence), TTS_PREFETCH);
     }
 
     private Flux<TtsChunk> synthesize(String sessionId, String text, AtomicLong sequence) {
@@ -137,6 +138,8 @@ public class HttpTtsService implements TtsService {
         return value == '\u3002'
                 || value == '\uff01'
                 || value == '\uff1f'
+                || value == '\uff1a'
+                || value == ':'
                 || value == '!'
                 || value == '?'
                 || value == '\uff1b'
