@@ -35,13 +35,18 @@ class FullDuplexAudioEngine(private val context: Context) {
     private var echoCanceler: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
     private var gainControl: AutomaticGainControl? = null
-    private var bargeInSpeechMs = 0
+    private var bargeInCandidateMs = 0
+    private var bargeInProbeSpeechMs = 0
     private var lastBargeInAtMs = 0L
+    private var lastBargeProbeAtMs = 0L
     @Volatile
     private var playbackActiveUntilMs = 0L
     @Volatile
     private var playbackStartedAtMs = 0L
+    @Volatile
+    private var bargeProbeUntilMs = 0L
     private var playbackEchoRms = 0.0
+    private var playbackMutedForProbe = false
 
     data class CaptureFrame(
         val pcm16le: ByteArray,
@@ -50,6 +55,7 @@ class FullDuplexAudioEngine(private val context: Context) {
         val playbackActive: Boolean,
         val playbackEchoRms: Double,
         val bargeInSpeechMs: Int,
+        val bargeInProbe: Boolean,
     )
 
     @SuppressLint("MissingPermission")
@@ -81,7 +87,17 @@ class FullDuplexAudioEngine(private val context: Context) {
                 val pcm = buffer.copyOf(read)
                 val rms = pcm.rms16le()
                 val active = isPlaybackActive()
-                onFrame(CaptureFrame(pcm, rms, detectBargeIn(rms, active), active, playbackEchoRms, bargeInSpeechMs))
+                onFrame(
+                    CaptureFrame(
+                        pcm,
+                        rms,
+                        detectBargeIn(rms, active),
+                        active,
+                        playbackEchoRms,
+                        maxOf(bargeInCandidateMs, bargeInProbeSpeechMs),
+                        isBargeProbeActive()
+                    )
+                )
             }
         }
     }
@@ -100,6 +116,7 @@ class FullDuplexAudioEngine(private val context: Context) {
         val durationMs = pcm16le.size / 2L * 1000L / sampleRate.coerceAtLeast(1)
         playbackActiveUntilMs = maxOf(now, playbackActiveUntilMs) + durationMs
         playbackActive.set(true)
+        setPlaybackProbeMuted(false)
         playbackQueue.offer(pcm16le)
     }
 
@@ -108,7 +125,7 @@ class FullDuplexAudioEngine(private val context: Context) {
         playbackActive.set(false)
         playbackActiveUntilMs = 0L
         playbackStartedAtMs = 0L
-        bargeInSpeechMs = 0
+        resetBargeInState()
         playbackEchoRms = 0.0
         playbackRunning.set(false)
         playbackThread?.interrupt()
@@ -122,7 +139,8 @@ class FullDuplexAudioEngine(private val context: Context) {
 
     fun playbackSuppressUntil(extraMs: Long): Long {
         val now = System.currentTimeMillis()
-        return maxOf(now, playbackActiveUntilMs + PLAYBACK_TAIL_MS) + extraMs
+        playbackActiveUntilMs = minOf(playbackActiveUntilMs, now + PLAYBACK_TAIL_MS)
+        return now + PLAYBACK_TAIL_MS + extraMs
     }
 
     fun stop() {
@@ -217,47 +235,87 @@ class FullDuplexAudioEngine(private val context: Context) {
     private fun detectBargeIn(rms: Double, isPlaybackActive: Boolean): Boolean {
         if (!isPlaybackActive) {
             playbackActive.set(false)
-            bargeInSpeechMs = 0
+            resetBargeInState()
             playbackEchoRms = 0.0
             return false
         }
         val now = System.currentTimeMillis()
         if (now - playbackStartedAtMs < BARGE_IN_ARM_DELAY_MS) {
-            bargeInSpeechMs = 0
+            resetBargeInState()
             playbackEchoRms = smoothEcho(playbackEchoRms, rms)
             return false
         }
+
+        if (isBargeProbeActive()) {
+            if (rms >= BARGE_IN_PROBE_RMS) {
+                bargeInProbeSpeechMs += FRAME_MS
+            } else {
+                bargeInProbeSpeechMs = maxOf(0, bargeInProbeSpeechMs - FRAME_MS)
+            }
+            if (bargeInProbeSpeechMs >= BARGE_IN_PROBE_MIN_MS && now - lastBargeInAtMs >= BARGE_IN_COOLDOWN_MS) {
+                lastBargeInAtMs = now
+                playbackActive.set(false)
+                playbackActiveUntilMs = 0L
+                setPlaybackProbeMuted(false)
+                return true
+            }
+            if (now >= bargeProbeUntilMs) {
+                lastBargeProbeAtMs = now
+                setPlaybackProbeMuted(false)
+                bargeProbeUntilMs = 0L
+                bargeInCandidateMs = 0
+                bargeInProbeSpeechMs = 0
+                playbackEchoRms = smoothEcho(playbackEchoRms, rms)
+            }
+            return false
+        }
+
         val dynamicThreshold = maxOf(BARGE_IN_RMS, playbackEchoRms + BARGE_IN_ECHO_MARGIN)
         if (rms >= dynamicThreshold) {
-            bargeInSpeechMs += FRAME_MS
+            bargeInCandidateMs += FRAME_MS
         } else {
-            bargeInSpeechMs = 0
+            bargeInCandidateMs = 0
             playbackEchoRms = smoothEcho(playbackEchoRms, rms)
         }
-        if (bargeInSpeechMs < BARGE_IN_MIN_MS) {
-            return false
+        if (bargeInCandidateMs >= BARGE_IN_PROBE_TRIGGER_MS && now - lastBargeProbeAtMs >= BARGE_IN_PROBE_COOLDOWN_MS) {
+            setPlaybackProbeMuted(true)
+            bargeProbeUntilMs = now + BARGE_IN_PROBE_MUTE_MS
+            bargeInProbeSpeechMs = 0
         }
-        if (now - lastBargeInAtMs < BARGE_IN_COOLDOWN_MS) {
-            return false
-        }
-        lastBargeInAtMs = now
-        playbackActive.set(false)
-        playbackActiveUntilMs = 0L
-        return true
+        return false
     }
 
     private fun smoothEcho(current: Double, rms: Double): Double {
         return if (current <= 0.0) rms else current * 0.92 + rms * 0.08
     }
 
+    private fun resetBargeInState() {
+        bargeInCandidateMs = 0
+        bargeInProbeSpeechMs = 0
+        bargeProbeUntilMs = 0L
+        setPlaybackProbeMuted(false)
+    }
+
+    private fun isBargeProbeActive(): Boolean = bargeProbeUntilMs > 0L
+
+    private fun setPlaybackProbeMuted(muted: Boolean) {
+        if (playbackMutedForProbe == muted) return
+        playbackMutedForProbe = muted
+        audioTrack?.setVolume(if (muted) 0f else 1f)
+    }
+
     companion object {
         private const val FRAME_MS = 20
-        private const val BARGE_IN_RMS = 0.060
-        private const val BARGE_IN_ECHO_MARGIN = 0.020
-        private const val BARGE_IN_MIN_MS = 220
-        private const val BARGE_IN_ARM_DELAY_MS = 450L
+        private const val BARGE_IN_RMS = 0.006
+        private const val BARGE_IN_ECHO_MARGIN = 0.003
+        private const val BARGE_IN_PROBE_TRIGGER_MS = 60
+        private const val BARGE_IN_PROBE_RMS = 0.005
+        private const val BARGE_IN_PROBE_MIN_MS = 60
+        private const val BARGE_IN_PROBE_MUTE_MS = 220L
+        private const val BARGE_IN_PROBE_COOLDOWN_MS = 650L
+        private const val BARGE_IN_ARM_DELAY_MS = 250L
         private const val BARGE_IN_COOLDOWN_MS = 1200
-        private const val PLAYBACK_TAIL_MS = 360L
+        private const val PLAYBACK_TAIL_MS = 80L
     }
 }
 

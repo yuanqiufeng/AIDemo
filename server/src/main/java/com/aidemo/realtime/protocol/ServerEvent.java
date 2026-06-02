@@ -31,4 +31,8 @@ public record ServerEvent(
     public static ServerEvent error(String sessionId, String reason) {
         return new ServerEvent(EventType.ERROR, sessionId, null, null, null, null, null, reason, null);
     }
+
+    public ServerEvent withMeta(Map<String, Object> meta) {
+        return new ServerEvent(type, sessionId, seq, text, isFinal, audio, sampleRate, reason, meta);
+    }
 }

@@ -9,7 +9,8 @@ data class ServerEvent(
     val text: String?,
     val audio: String?,
     val sampleRate: Int?,
-    val reason: String?
+    val reason: String?,
+    val turn: Long?
 ) {
     companion object {
         fun parse(json: String): ServerEvent {
@@ -21,7 +22,8 @@ data class ServerEvent(
                 text = obj.optString("text").takeIf { it.isNotBlank() },
                 audio = obj.optString("audio").takeIf { it.isNotBlank() },
                 sampleRate = obj.optIntOrNull("sampleRate"),
-                reason = obj.optString("reason").takeIf { it.isNotBlank() }
+                reason = obj.optString("reason").takeIf { it.isNotBlank() },
+                turn = obj.optJSONObject("meta")?.optLongOrNull("turn")
             )
         }
     }

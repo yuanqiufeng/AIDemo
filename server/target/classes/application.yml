@@ -9,18 +9,18 @@ realtime:
   audio:
     sample-rate: 16000
     frame-ms: 20
-    speech-start-rms: 0.0198
-    speech-end-rms: 0.0198
-    min-speech-ms: 260
-    silence-endpoint-ms: 550
+    speech-start-rms: 0.008
+    speech-end-rms: 0.004
+    min-speech-ms: 120
+    silence-endpoint-ms: 420
     max-utterance-ms: 600000
     assistant-echo-hold-ms: 350
     barge-in-enabled: true
     interrupt-rms: 0.09
     interrupt-min-speech-ms: 520
     assistant-barge-in-delay-ms: 700
-    barge-in-restart-delay-ms: 350
-    tts-tail-ignore-ms: 1500
+    barge-in-restart-delay-ms: 80
+    tts-tail-ignore-ms: 150
   asr:
     mode: http
     base-url: ${ASR_BASE_URL:http://127.0.0.1:11095}

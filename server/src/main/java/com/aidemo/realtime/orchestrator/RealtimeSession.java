@@ -22,6 +22,7 @@ import java.util.Base64;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -43,6 +44,7 @@ public class RealtimeSession {
     private final List<AudioFrame> utteranceFrames = new CopyOnWriteArrayList<>();
     private final Deque<AudioFrame> preRollFrames = new ArrayDeque<>();
     private final AtomicLong audioSeq = new AtomicLong();
+    private final AtomicLong responseTurn = new AtomicLong();
     private final AtomicBoolean assistantSpeaking = new AtomicBoolean(false);
     private volatile Disposable responsePipeline;
     private volatile Instant ignoreAudioUntil = Instant.EPOCH;
@@ -88,17 +90,20 @@ public class RealtimeSession {
                 1,
                 Instant.now()
         );
-        boolean acceptedClientBargeIn = false;
-        if (assistantSpeaking.get() && clientBargeIn && properties.audio().bargeInEnabled()) {
+        if (clientBargeIn && properties.audio().bargeInEnabled()) {
             log.info("Client barge-in: session={}, rms={}", id, String.format("%.4f", PcmAudio.rms16le(frame.pcm16le())));
-            interruptForBargeIn("client-barge-in");
+            if (assistantSpeaking.get()) {
+                interruptForBargeIn("client-barge-in");
+            }
             utteranceFrames.clear();
             preRollFrames.clear();
-            vad.reset();
+            vad.forceSpeech();
             ignoreAudioUntil = Instant.EPOCH;
-            acceptedClientBargeIn = true;
+            utteranceFrames.add(frame);
+            emit(ServerEvent.of(EventType.VAD_SPEECH_START, id));
+            return;
         }
-        if (!clientBargeIn && !acceptedClientBargeIn && shouldIgnoreForAssistantEcho()) {
+        if (!clientBargeIn && shouldIgnoreForAssistantEcho()) {
             rememberPreRoll(frame);
             if (properties.audio().bargeInEnabled() && PcmAudio.rms16le(frame.pcm16le()) >= properties.audio().interruptRms()) {
                 log.info("Audio ignored during echo hold but above interrupt threshold: session={}, rms={}",
@@ -155,7 +160,7 @@ public class RealtimeSession {
 
     public void forceRespond(String text) {
         if (text != null && !text.isBlank()) {
-            recognizeAndRespond(List.of(), text);
+            recognizeAndRespond(List.of(), text, false);
         }
     }
 
@@ -168,6 +173,7 @@ public class RealtimeSession {
     }
 
     public void interrupt(String reason) {
+        long cancelledTurn = responseTurn.incrementAndGet();
         Disposable pipeline = responsePipeline;
         if (pipeline != null && !pipeline.isDisposed()) {
             pipeline.dispose();
@@ -175,10 +181,11 @@ public class RealtimeSession {
         assistantSpeaking.set(false);
         bargeInSpeechMs = 0;
         holdAssistantEcho();
-        emit(new ServerEvent(EventType.INTERRUPT, id, null, null, null, null, null, reason, null));
+        emit(withTurn(new ServerEvent(EventType.INTERRUPT, id, null, null, null, null, null, reason, null), cancelledTurn));
     }
 
     private void interruptForBargeIn(String reason) {
+        long cancelledTurn = responseTurn.incrementAndGet();
         Disposable pipeline = responsePipeline;
         if (pipeline != null && !pipeline.isDisposed()) {
             pipeline.dispose();
@@ -186,7 +193,7 @@ public class RealtimeSession {
         assistantSpeaking.set(false);
         bargeInSpeechMs = 0;
         ignoreAudioUntil = Instant.now().plus(Duration.ofMillis(properties.audio().bargeInRestartDelayMs()));
-        emit(new ServerEvent(EventType.INTERRUPT, id, null, null, null, null, null, reason, null));
+        emit(withTurn(new ServerEvent(EventType.INTERRUPT, id, null, null, null, null, null, reason, null), cancelledTurn));
     }
 
     public void close() {
@@ -214,18 +221,23 @@ public class RealtimeSession {
     }
 
     private void recognizeAndRespond(List<AudioFrame> finished, String text) {
+        recognizeAndRespond(finished, text, true);
+    }
+
+    private void recognizeAndRespond(List<AudioFrame> finished, String text, boolean filterAssistantEcho) {
         if (text == null || text.isBlank()) {
             return;
         }
-        if (isLikelyAssistantEcho(text)) {
+        if (filterAssistantEcho && isLikelyAssistantEcho(text)) {
             log.info("ASR final ignored as assistant echo: session={}, text={}, lastAssistantText={}", id, text, lastAssistantText);
             emit(ServerEvent.of(EventType.VAD_SPEECH_END, id));
             return;
         }
         interrupt("new-turn");
-        emit(ServerEvent.text(EventType.ASR_FINAL, id, text, true));
+        long turn = responseTurn.incrementAndGet();
+        emitForTurn(ServerEvent.text(EventType.ASR_FINAL, id, text, true), turn);
         Instant turnStartedAt = Instant.now();
-        log.info("Turn response start: session={}, userText={}", id, text);
+        log.info("Turn response start: session={}, turn={}, userText={}", id, turn, text);
 
         AtomicInteger llmChars = new AtomicInteger();
         AtomicBoolean firstLlmDeltaSeen = new AtomicBoolean(false);
@@ -236,18 +248,27 @@ public class RealtimeSession {
                             id, Duration.between(turnStartedAt, Instant.now()).toMillis(), error.toString());
                     return Flux.just(LLM_ERROR_FALLBACK);
                 })
+                .takeWhile(delta -> isCurrentTurn(turn))
                 .doOnNext(delta -> {
+                    if (!isCurrentTurn(turn)) {
+                        return;
+                    }
                     if (firstLlmDeltaSeen.compareAndSet(false, true)) {
-                        log.info("LLM first delta: session={}, elapsedMs={}", id, Duration.between(turnStartedAt, Instant.now()).toMillis());
+                        log.info("LLM first delta: session={}, turn={}, elapsedMs={}", id, turn, Duration.between(turnStartedAt, Instant.now()).toMillis());
                     }
                     llmChars.addAndGet(delta.length());
                     rememberAssistantText(delta);
-                    emit(ServerEvent.text(EventType.LLM_DELTA, id, delta, false));
+                    emitForTurn(ServerEvent.text(EventType.LLM_DELTA, id, delta, false), turn);
                 })
                 .doOnComplete(() -> {
+                    if (!isCurrentTurn(turn)) {
+                        log.info("LLM stale completion ignored: session={}, turn={}, activeTurn={}",
+                                id, turn, responseTurn.get());
+                        return;
+                    }
                     log.info("LLM done: session={}, elapsedMs={}, responseChars={}",
                             id, Duration.between(turnStartedAt, Instant.now()).toMillis(), llmChars.get());
-                    emit(ServerEvent.of(EventType.LLM_DONE, id));
+                    emitForTurn(ServerEvent.of(EventType.LLM_DONE, id), turn);
                 })
                 .share();
 
@@ -260,17 +281,21 @@ public class RealtimeSession {
         AtomicBoolean firstTtsChunkSeen = new AtomicBoolean(false);
         responsePipeline = ttsService.streamAudio(id, llm)
                 .timeout(properties.llm().responseTimeout())
+                .takeWhile(chunk -> isCurrentTurn(turn))
                 .doOnNext(chunk -> {
+                    if (!isCurrentTurn(turn)) {
+                        return;
+                    }
                     if (firstTtsChunkSeen.compareAndSet(false, true)) {
-                        emit(ServerEvent.of(EventType.TTS_START, id));
-                        log.info("TTS first chunk: session={}, elapsedMs={}, bytes={}, sampleRate={}",
-                                id, Duration.between(turnStartedAt, Instant.now()).toMillis(), chunk.pcm16le().length, chunk.sampleRate());
+                        emitForTurn(ServerEvent.of(EventType.TTS_START, id), turn);
+                        log.info("TTS first chunk: session={}, turn={}, elapsedMs={}, bytes={}, sampleRate={}",
+                                id, turn, Duration.between(turnStartedAt, Instant.now()).toMillis(), chunk.pcm16le().length, chunk.sampleRate());
                     }
                     ttsPlaybackMs.addAndGet(chunkDurationMs(chunk.pcm16le().length, chunk.sampleRate()));
                     int count = ttsChunks.incrementAndGet();
                     if (count == 1 || count % 10 == 0) {
-                        log.info("TTS chunk: session={}, count={}, bytes={}, sampleRate={}",
-                                id, count, chunk.pcm16le().length, chunk.sampleRate());
+                        log.info("TTS chunk: session={}, turn={}, count={}, bytes={}, sampleRate={}",
+                                id, turn, count, chunk.pcm16le().length, chunk.sampleRate());
                     }
                 })
                 .map(chunk -> ServerEvent.audio(
@@ -280,22 +305,32 @@ public class RealtimeSession {
                         Base64.getEncoder().encodeToString(chunk.pcm16le()),
                         chunk.sampleRate()
                 ))
-                .doOnNext(this::emit)
+                .doOnNext(event -> emitForTurn(event, turn))
                 .doOnComplete(() -> {
+                    if (!isCurrentTurn(turn)) {
+                        log.info("TTS stale completion ignored: session={}, turn={}, activeTurn={}, chunks={}",
+                                id, turn, responseTurn.get(), ttsChunks.get());
+                        return;
+                    }
                     assistantSpeaking.set(false);
                     bargeInSpeechMs = 0;
                     holdAssistantEcho(properties.audio().ttsTailIgnoreMs());
-                    log.info("TTS done: session={}, elapsedMs={}, chunks={}, playbackMs={}",
-                            id, Duration.between(turnStartedAt, Instant.now()).toMillis(), ttsChunks.get(), ttsPlaybackMs.get());
-                    emit(ServerEvent.of(EventType.TTS_DONE, id));
+                    log.info("TTS done: session={}, turn={}, elapsedMs={}, chunks={}, playbackMs={}",
+                            id, turn, Duration.between(turnStartedAt, Instant.now()).toMillis(), ttsChunks.get(), ttsPlaybackMs.get());
+                    emitForTurn(ServerEvent.of(EventType.TTS_DONE, id), turn);
                 })
                 .subscribe(event -> {
                 }, error -> {
+                    if (!isCurrentTurn(turn)) {
+                        log.info("Realtime stale response error ignored: session={}, turn={}, activeTurn={}, error={}",
+                                id, turn, responseTurn.get(), error.toString());
+                        return;
+                    }
                     assistantSpeaking.set(false);
                     bargeInSpeechMs = 0;
                     holdAssistantEcho(properties.audio().ttsTailIgnoreMs());
-                    log.warn("Realtime response pipeline failed: session={}, elapsedMs={}",
-                            id, Duration.between(turnStartedAt, Instant.now()).toMillis(), error);
+                    log.warn("Realtime response pipeline failed: session={}, turn={}, elapsedMs={}",
+                            id, turn, Duration.between(turnStartedAt, Instant.now()).toMillis(), error);
                     emitError(error);
                 });
     }
@@ -322,22 +357,8 @@ public class RealtimeSession {
             bargeInSpeechMs = 0;
             return true;
         }
-        long sinceAssistantStartMs = Duration.between(assistantSpeechStartedAt, Instant.now()).toMillis();
-        if (sinceAssistantStartMs < properties.audio().assistantBargeInDelayMs()) {
-            bargeInSpeechMs = 0;
-            return false;
-        }
-        double rms = PcmAudio.rms16le(frame.pcm16le());
-        if (rms < properties.audio().interruptRms()) {
-            bargeInSpeechMs = 0;
-            return false;
-        }
-        bargeInSpeechMs += properties.audio().frameMs();
-        if (bargeInSpeechMs < properties.audio().interruptMinSpeechMs()) {
-            return false;
-        }
-        log.info("Accepted barge-in: session={}, rms={}, speechMs={}, sinceAssistantStartMs={}",
-                id, String.format("%.4f", rms), bargeInSpeechMs, sinceAssistantStartMs);
+        log.info("Accepted client-confirmed barge-in: session={}, rms={}",
+                id, String.format("%.4f", PcmAudio.rms16le(frame.pcm16le())));
         return true;
     }
 
@@ -371,7 +392,13 @@ public class RealtimeSession {
         if (normalizedText.length() < 2 || normalizedAssistant.length() < 2) {
             return false;
         }
+        if (normalizedText.length() < 4) {
+            return false;
+        }
         if (Duration.between(lastAssistantTextAt, Instant.now()).toSeconds() > 45) {
+            return false;
+        }
+        if (normalizedText.length() < 8 && normalizedAssistant.length() > normalizedText.length() + 3) {
             return false;
         }
         return normalizedAssistant.contains(normalizedText)
@@ -450,6 +477,23 @@ public class RealtimeSession {
 
     private void emit(ServerEvent event) {
         outbound.tryEmitNext(event);
+    }
+
+    private boolean isCurrentTurn(long turn) {
+        return responseTurn.get() == turn;
+    }
+
+    private void emitForTurn(ServerEvent event, long turn) {
+        if (!isCurrentTurn(turn)) {
+            log.info("Dropped stale event: session={}, event={}, turn={}, activeTurn={}",
+                    id, event.type(), turn, responseTurn.get());
+            return;
+        }
+        emit(withTurn(event, turn));
+    }
+
+    private ServerEvent withTurn(ServerEvent event, long turn) {
+        return event.withMeta(Map.of("turn", turn));
     }
 
     private void emitError(Throwable error) {

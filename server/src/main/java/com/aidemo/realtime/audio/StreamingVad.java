@@ -64,4 +64,10 @@ public class StreamingVad {
         speechMs = 0;
         silenceMs = 0;
     }
+
+    public void forceSpeech() {
+        state = VadState.SPEECH;
+        speechMs = 0;
+        silenceMs = 0;
+    }
 }

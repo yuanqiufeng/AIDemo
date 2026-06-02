@@ -42,6 +42,13 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
     private var sentAudioFrames = 0L
     private var suppressedPlaybackFrames = 0L
     private var receivedTtsChunks = 0L
+    private var activeAssistantTurn: Long = 0L
+    private var interruptedAssistantTurn: Long = 0L
+    private var dropAssistantAudioUntilNextFinal = false
+    @Volatile
+    private var assistantResponseActive = false
+    private var busySpeechMs = 0
+    private var busySpeechInterruptSent = false
     private val playbackPreRollFrames = ArrayDeque<ByteArray>()
     @Volatile
     private var suppressMicUntilMs = 0L
@@ -72,6 +79,8 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
     fun interrupt() {
         webSocket?.send(JSONObject().put("type", "interrupt").toString())
         stopLocalTtsFallback()
+        markAssistantInterrupted(activeAssistantTurn)
+        assistantResponseActive = false
         audioEngine.stopPlayback()
     }
 
@@ -86,6 +95,8 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
         ) ?: false
         _ui.update {
             if (sent) {
+                assistantResponseActive = true
+                resetBusySpeechInterrupt()
                 it.copy(state = "thinking").log("you: $trimmed")
             } else {
                 it.copy(state = "error").log("text send failed: WebSocket is not connected")
@@ -139,6 +150,7 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
         suppressedPlaybackFrames = 0
         suppressMicUntilMs = 0
         playbackPreRollFrames.clear()
+        resetBusySpeechInterrupt()
         _ui.update { it.log("audio capture starting") }
         audioJob = viewModelScope.launch(Dispatchers.IO) {
             audioEngine.startCapture { frame ->
@@ -150,16 +162,39 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
                     }
                     socket.send(JSONObject().put("type", "interrupt").toString())
                     stopLocalTtsFallback()
+                    markAssistantInterrupted(activeAssistantTurn)
+                    assistantResponseActive = false
+                    resetBusySpeechInterrupt()
                     audioEngine.stopPlayback()
                     suppressMicUntilMs = 0
                     _ui.update {
                         it.log(
                             "audio local bargeIn interrupt rms=${"%.4f".format(frame.rms)} " +
                                 "echo=${"%.4f".format(frame.playbackEchoRms)} " +
-                                "speechMs=${frame.bargeInSpeechMs} preRoll=${preRoll.size}"
+                                "speechMs=${frame.bargeInSpeechMs} probe=${frame.bargeInProbe} discardedPreRoll=${preRoll.size}"
                         )
                     }
-                    preRoll.forEach { pcm -> sendAudioFrame(socket, pcm, true, frame.rms, true) }
+                    sendAudioFrame(socket, frame.pcm16le, true, frame.rms, true)
+                    return@startCapture
+                } else if (shouldVoiceInterruptWhileBusy(frame)) {
+                    socket.send(JSONObject().put("type", "interrupt").toString())
+                    stopLocalTtsFallback()
+                    markAssistantInterrupted(activeAssistantTurn)
+                    assistantResponseActive = false
+                    busySpeechInterruptSent = true
+                    audioEngine.stopPlayback()
+                    suppressMicUntilMs = 0
+                    synchronized(playbackPreRollFrames) {
+                        playbackPreRollFrames.clear()
+                    }
+                    _ui.update {
+                        it.copy(state = "interrupted").log(
+                            "audio voice interrupt busy rms=${"%.4f".format(frame.rms)} " +
+                                "echo=${"%.4f".format(frame.playbackEchoRms)} speechMs=$busySpeechMs playback=${frame.playbackActive}"
+                        )
+                    }
+                    sendAudioFrame(socket, frame.pcm16le, true, frame.rms, frame.playbackActive)
+                    return@startCapture
                 } else if (System.currentTimeMillis() < suppressMicUntilMs) {
                     return@startCapture
                 } else if (frame.playbackActive) {
@@ -169,7 +204,8 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
                         _ui.update {
                             it.log(
                                 "audio suppressed playback rms=${"%.4f".format(frame.rms)} " +
-                                    "echo=${"%.4f".format(frame.playbackEchoRms)} speechMs=${frame.bargeInSpeechMs}"
+                                    "echo=${"%.4f".format(frame.playbackEchoRms)} " +
+                                    "speechMs=${frame.bargeInSpeechMs} probe=${frame.bargeInProbe}"
                             )
                         }
                     }
@@ -222,17 +258,33 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
             "asr.final" -> {
                 receivedServerTtsThisTurn = false
                 localTtsFallbackJob?.cancel()
+                dropAssistantAudioUntilNextFinal = false
+                assistantResponseActive = true
+                resetBusySpeechInterrupt()
                 _ui.update { it.copy(state = "thinking", asrText = event.text.orEmpty(), aiText = "").log("asr.final ${event.text.orEmpty()}") }
             }
             "llm.delta" -> {
+                if (shouldDropAssistantEvent(event, "llm.delta")) return
+                noteAssistantTurn(event.turn)
+                assistantResponseActive = true
                 val delta = event.text.orEmpty()
                 _ui.update { it.copy(aiText = it.aiText + delta).log("llm.delta $delta") }
             }
             "llm.done" -> {
+                if (shouldDropAssistantEvent(event, "llm.done")) return
+                assistantResponseActive = true
                 _ui.update { it.log("llm.done") }
             }
-            "tts.start" -> _ui.update { it.copy(state = "assistant speaking").log("tts.start") }
+            "tts.start" -> {
+                if (shouldDropAssistantEvent(event, "tts.start")) return
+                noteAssistantTurn(event.turn)
+                assistantResponseActive = true
+                _ui.update { it.copy(state = "assistant speaking").log("tts.start turn=${event.turn ?: "-"}") }
+            }
             "tts.chunk" -> event.audio?.let { audio ->
+                if (shouldDropAssistantEvent(event, "tts.chunk")) return
+                noteAssistantTurn(event.turn)
+                assistantResponseActive = true
                 val bytes = audio.decodeBase64()?.toByteArray()
                 if (bytes != null) {
                     receivedServerTtsThisTurn = true
@@ -247,18 +299,75 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
                 }
             }
             "tts.done" -> {
+                if (shouldDropAssistantEvent(event, "tts.done")) return
+                assistantResponseActive = false
+                resetBusySpeechInterrupt()
                 suppressMicUntilMs = audioEngine.playbackSuppressUntil(TTS_TAIL_SUPPRESS_MS)
                 val suppressForMs = (suppressMicUntilMs - System.currentTimeMillis()).coerceAtLeast(0L)
                 _ui.update { it.copy(state = "listening").log("tts.done suppressMic=${suppressForMs}ms") }
             }
             "interrupt" -> {
                 stopLocalTtsFallback()
+                markAssistantInterrupted(event.turn ?: activeAssistantTurn)
+                assistantResponseActive = false
+                resetBusySpeechInterrupt()
                 audioEngine.stopPlayback()
-                _ui.update { it.copy(state = "interrupted").log("interrupt ${event.reason.orEmpty()}") }
+                _ui.update { it.copy(state = "interrupted").log("interrupt ${event.reason.orEmpty()} turn=${event.turn ?: "-"}") }
             }
-            "error" -> _ui.update { it.copy(state = "error").log("server error ${event.reason.orEmpty()}") }
+            "error" -> {
+                assistantResponseActive = false
+                resetBusySpeechInterrupt()
+                _ui.update { it.copy(state = "error").log("server error ${event.reason.orEmpty()}") }
+            }
             else -> _ui.update { it.log(event.type) }
         }
+    }
+
+    private fun shouldVoiceInterruptWhileBusy(frame: FullDuplexAudioEngine.CaptureFrame): Boolean {
+        if (!assistantResponseActive || busySpeechInterruptSent) {
+            if (!assistantResponseActive) {
+                resetBusySpeechInterrupt()
+            }
+            return false
+        }
+        val threshold = maxOf(BUSY_SPEECH_INTERRUPT_RMS, frame.playbackEchoRms + BUSY_SPEECH_ECHO_MARGIN)
+        if (frame.rms >= threshold) {
+            busySpeechMs += AUDIO_FRAME_MS
+        } else {
+            busySpeechMs = maxOf(0, busySpeechMs - AUDIO_FRAME_MS)
+        }
+        return busySpeechMs >= BUSY_SPEECH_INTERRUPT_MS
+    }
+
+    private fun resetBusySpeechInterrupt() {
+        busySpeechMs = 0
+        busySpeechInterruptSent = false
+    }
+
+    private fun markAssistantInterrupted(turn: Long) {
+        interruptedAssistantTurn = maxOf(interruptedAssistantTurn, turn)
+        dropAssistantAudioUntilNextFinal = true
+        receivedServerTtsThisTurn = false
+        receivedTtsChunks = 0
+    }
+
+    private fun noteAssistantTurn(turn: Long?) {
+        if (turn != null && turn > activeAssistantTurn) {
+            activeAssistantTurn = turn
+        }
+    }
+
+    private fun shouldDropAssistantEvent(event: ServerEvent, label: String): Boolean {
+        val turn = event.turn
+        if (turn != null && turn <= interruptedAssistantTurn) {
+            _ui.update { it.log("drop stale $label turn=$turn interrupted=$interruptedAssistantTurn") }
+            return true
+        }
+        if (dropAssistantAudioUntilNextFinal && (event.type.startsWith("tts.") || event.type.startsWith("llm."))) {
+            _ui.update { it.log("drop interrupted $label waiting_asr_final turn=${turn ?: "-"}") }
+            return true
+        }
+        return false
     }
 
     private fun RealtimeUiState.log(line: String): RealtimeUiState =
@@ -287,8 +396,12 @@ class RealtimeViewModel(application: Application) : AndroidViewModel(application
     companion object {
         const val DEFAULT_SERVER_URL = "ws://192.168.31.211:8080/ws/realtime"
         private const val ENABLE_LOCAL_TTS_FALLBACK = false
-        private const val TTS_TAIL_SUPPRESS_MS = 500L
+        private const val TTS_TAIL_SUPPRESS_MS = 80L
         private const val BARGE_IN_PREROLL_FRAMES = 16
+        private const val AUDIO_FRAME_MS = 20
+        private const val BUSY_SPEECH_INTERRUPT_RMS = 0.006
+        private const val BUSY_SPEECH_ECHO_MARGIN = 0.004
+        private const val BUSY_SPEECH_INTERRUPT_MS = 80
     }
 }
 
