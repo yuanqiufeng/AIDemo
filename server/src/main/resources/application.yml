@@ -23,7 +23,7 @@ realtime:
     tts-tail-ignore-ms: 150
   asr:
     mode: http
-    base-url: ${ASR_BASE_URL:http://127.0.0.1:11095}
+    base-url: ${ASR_BASE_URL:http://127.0.0.1:10095}
     connect-timeout: 1500ms
     response-timeout: 120000ms
   llm:
@@ -34,5 +34,5 @@ realtime:
     response-timeout: ${LLM_RESPONSE_TIMEOUT:180s}
   tts:
     mode: http
-    base-url: ${TTS_BASE_URL:http://127.0.0.1:18002}
+    base-url: ${TTS_BASE_URL:http://127.0.0.1:8002}
     sample-rate: ${TTS_SAMPLE_RATE:24000}
